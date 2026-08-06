@@ -15,12 +15,17 @@ LOG_DIR = "logs"
 
 
 def num(value):
-    """JSONのnull等、数値以外の値は0として扱う。"""
-    return value if isinstance(value, (int, float)) else 0
+    """JSONのnullやbool等、数値以外の値は0として扱う。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value
 
 
 def load_reports(session):
     path = os.path.join(LOG_DIR, session + ".jsonl")
+    # まだ一度も報告が来ていないセッションはログファイル自体が無い
+    if not os.path.exists(path):
+        return []
     reports = []
     with open(path) as f:
         for line in f:
