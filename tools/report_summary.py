@@ -18,11 +18,18 @@ LOG_DIR = "logs"
 
 
 def num(value):
-    """JSONのnull・bool・非有限値(NaN/Infinity)等、有限の数値以外は0として扱う。"""
+    """JSONのnull・bool・非有限値等、有限のfloatに変換できない値は0として扱う。
+
+    後段の集計はfloat演算を含むため、float範囲を超える巨大int(例: 10**400)も
+    ここで弾いておく。
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
-    # 巨大intはfloat変換なしで常に有限なので、floatのみ有限性を確認する
-    if isinstance(value, float) and not math.isfinite(value):
+    try:
+        as_float = float(value)
+    except OverflowError:
+        return 0
+    if not math.isfinite(as_float):
         return 0
     return value
 
