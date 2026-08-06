@@ -71,7 +71,12 @@ def report(game):
         return jsonify(ok=True)
 
     payload.pop("save", None)
-    line = json.dumps(payload, ensure_ascii=False)
+    try:
+        # Infinity/NaN/1e999等はそのまま書くとlatest.jsonが不正JSONになり
+        # /statusの応答ごと壊れてダッシュボード全体が止まるため拒否する
+        line = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except ValueError:
+        abort(400, description="non-finite numbers not allowed")
     write_atomic(d / "latest.json", line)
     with (d / f"history_{today()}.jsonl").open("a", encoding="utf-8") as f:
         f.write(line + "\n")
@@ -234,12 +239,23 @@ async function updateChart(game, sec){
   c.update();
 }
 
+// game 0件時の空表示(初回のloading...置き換え/全ゲーム消滅時の復元)
+function updateEmptyState(count){
+  let empty = document.getElementById('empty');
+  if (count){ if (empty) empty.remove(); return; }
+  if (!empty){
+    empty = document.createElement('p');
+    empty.id = 'empty';
+    document.getElementById('games').appendChild(empty);
+  }
+  empty.textContent = 'まだ報告がありません';
+}
+
 async function refresh(){
   let st;
   try { st = await (await fetch('/status')).json(); } catch { return; }
   const games = Object.keys(st);
-  const empty = document.getElementById('empty');
-  if (empty && games.length) empty.remove();
+  updateEmptyState(games.length);
   // /statusから消えたゲームのセクションを古い値のまま残さない
   for (const sec of document.querySelectorAll('section[id^="sec-"]')){
     const g = sec.id.slice(4);
