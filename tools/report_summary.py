@@ -98,6 +98,8 @@ def main():
 
     if args.recent < 0:
         parser.error("--recent must be a nonnegative integer")
+    # Py_ssize_t超はdeque(maxlen=...)がOverflowErrorを投げる。全件選択と等価なので丸める
+    args.recent = min(args.recent, sys.maxsize)
 
     reports = load_reports(args.session, args.recent)
 
