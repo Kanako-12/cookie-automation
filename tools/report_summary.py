@@ -9,8 +9,14 @@ Usage:
 import argparse
 import json
 import os
+import re
 
 LOG_DIR = "logs"
+
+
+def num(value):
+    """JSONのnull等、数値以外の値は0として扱う。"""
+    return value if isinstance(value, (int, float)) else 0
 
 
 def load_reports(session):
@@ -33,15 +39,16 @@ def average_cps(reports):
         return 0.0
     total = 0
     for r in reports:
-        total += r.get("cps", 0)
+        total += num(r.get("cps"))
     return total / len(reports)
 
 
 def peak_cookies(reports):
     best = 0
     for r in reports:
-        if r.get("cookies", 0) > best:
-            best = r["cookies"]
+        cookies = num(r.get("cookies"))
+        if cookies > best:
+            best = cookies
     return best
 
 
@@ -50,6 +57,10 @@ def main():
     parser.add_argument("--session", required=True, help="session name (log file stem)")
     parser.add_argument("--recent", type=int, default=0, help="only show the N most recent reports")
     args = parser.parse_args()
+
+    # セッション名はログファイル名の一部になるため、パス区切りや".."を含む値を拒否する
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.session):
+        parser.error("--session must contain only letters, digits, hyphens, or underscores")
 
     if args.recent < 0:
         parser.error("--recent must be a nonnegative integer")
@@ -67,8 +78,8 @@ def main():
     print(f"peak bank:   {peak_cookies(reports)}")
 
     latest = reports[-1]
-    print(f"latest wrath: {latest.get('elderWrath', 0)}")
-    print(f"latest upgrades: {latest.get('upgrades', 0)}")
+    print(f"latest wrath: {num(latest.get('elderWrath'))}")
+    print(f"latest upgrades: {num(latest.get('upgrades'))}")
 
 
 if __name__ == "__main__":
