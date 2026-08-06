@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.1
+// @version      2.1.1
 // @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
@@ -23,6 +23,12 @@
       headers: { 'Content-Type': 'application/json' },
       data: JSON.stringify(payload),
       timeout: 10000,
+      // 401/500等はonerrorでなくonloadに来るため、ステータスも失敗判定する
+      onload: (res) => {
+        if (res.status < 200 || res.status >= 300) {
+          console.warn('[gamehub] report rejected: HTTP ' + res.status);
+        }
+      },
       onerror: () => console.warn('[gamehub] report failed'),
       ontimeout: () => console.warn('[gamehub] report timed out'),
     });
@@ -64,6 +70,9 @@
   // --- 1s: 購入系(待ち時間込み回収期間ベースの貪欲法) ---
   every(1000, () => {
     // tech(黙示録研究)とtoggle(シーズン切替等)は自動購入しない
+    // buy(1)のbypassがスキップするのは確認ダイアログ(clickFunction)のみで、
+    // 支払いはbuy()内のcanBuy+Game.Spendで必ず発生する。ランプ払いだけは
+    // bypassで無償取得になるが、該当するSugar frenzyはtoggleなので除外済み
     Game.UpgradesInStore
       .filter(u => u.canBuy() && u.pool !== 'tech' && u.pool !== 'toggle')
       .sort((a, b) => a.getPrice() - b.getPrice())
