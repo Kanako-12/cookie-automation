@@ -72,20 +72,22 @@ def load_reports(session, limit=0):
 def average_cps(reports):
     if not reports:
         return 0.0
-    # 単純合計だと巨大値(クリッカー系は指数的に伸びる)でinfに飽和し得るため逐次平均で計算する
+    # 単純合計だと巨大値(クリッカー系は指数的に伸びる)でinfに飽和し得るため逐次平均で計算する。
+    # (x - mean)の差分形は符号混在の巨大値同士でオーバーフローするので、各項を先に割ってから足す
     mean = 0.0
     for n, r in enumerate(reports, start=1):
-        mean += (num(r.get("cps")) - mean) / n
+        mean = mean * ((n - 1) / n) + num(r.get("cps")) / n
     return mean
 
 
 def peak_cookies(reports):
-    best = 0
+    # 0で初期化すると全件負のときに実在しないピークを報告してしまう
+    best = None
     for r in reports:
         cookies = num(r.get("cookies"))
-        if cookies > best:
+        if best is None or cookies > best:
             best = cookies
-    return best
+    return best if best is not None else 0
 
 
 def main():
