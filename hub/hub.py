@@ -51,10 +51,13 @@ def report(game):
     payload["ts"] = time.time()
     d.mkdir(parents=True, exist_ok=True)
 
-    # typeを送らない旧クライアントはsaveキーの有無で振り分ける。
-    # タイポ等の未知typeをreport扱いに落とすとsave便がlatest.jsonを潰す
-    # 事故が再発するため、save/report以外は明示的に拒否する
-    kind = payload.get("type") or ("save" if "save" in payload else "report")
+    # typeキー自体を送らない旧クライアントのみsaveキーの有無で振り分ける。
+    # タイポや空文字などの不正typeをreport扱いに落とすとsave便が
+    # latest.jsonを潰す事故が再発するため、save/report以外は明示的に拒否する
+    if "type" in payload:
+        kind = payload["type"]
+    else:
+        kind = "save" if "save" in payload else "report"
     if kind not in ("save", "report"):
         abort(400, description="type must be 'save' or 'report'")
 
@@ -141,7 +144,9 @@ const CARDS = [
   ['elderWrath','👵 elderWrath'], ['wrinklers','🐛 wrinklers'],
 ];
 const WRATH = ['平穏','ざわめき','高まり','黙示録'];
-const charts = {};   // game名 -> Chart
+// game名 -> Chart。'constructor'等のgame名がプロトタイプと衝突しないよう
+// プロトタイプなしオブジェクトを使う
+const charts = Object.create(null);
 
 function fmt(v){
   if (typeof v !== 'number' || !isFinite(v)) return v ?? '-';
@@ -235,6 +240,14 @@ async function refresh(){
   const games = Object.keys(st);
   const empty = document.getElementById('empty');
   if (empty && games.length) empty.remove();
+  // /statusから消えたゲームのセクションを古い値のまま残さない
+  for (const sec of document.querySelectorAll('section[id^="sec-"]')){
+    const g = sec.id.slice(4);
+    if (!games.includes(g)){
+      sec.remove();
+      if (charts[g]){ charts[g].destroy(); delete charts[g]; }
+    }
+  }
   for (const game of games){
     // 1ゲームの失敗(グラフ生成エラー等)で他ゲームの描画を止めない
     try {
