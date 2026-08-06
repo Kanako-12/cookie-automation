@@ -52,10 +52,12 @@ def load_reports(session, limit=0):
                 continue
             if not line:
                 continue
-            # 書き込み途中のプロセス停止等で壊れた行が混ざっても、残りの集計は続ける
+            # 書き込み途中のプロセス停止等で壊れた行が混ざっても、残りの集計は続ける。
+            # ValueErrorで捕るのは、桁数制限超の整数(3.11+)がJSONDecodeErrorではなく
+            # 素のValueErrorを投げるため
             try:
                 record = json.loads(line)
-            except json.JSONDecodeError:
+            except ValueError:
                 print(f"warning: {path}:{lineno}: skipping malformed JSON line", file=sys.stderr)
                 continue
             if not isinstance(record, dict):
