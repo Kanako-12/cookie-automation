@@ -1,5 +1,5 @@
 from flask import Flask, abort, jsonify, request
-import json, pathlib, re, time
+import collections, json, os, pathlib, re, tempfile, time
 
 app = Flask(__name__)
 DATA = pathlib.Path.home() / "gamehub" / "data"
@@ -21,6 +21,18 @@ def today():
     return time.strftime("%Y%m%d")
 
 
+def write_atomic(path, text):
+    """並行リクエストで書きかけ同士が混ざらないよう一時ファイル経由で置き換える"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def read_json(path):
     """壊れたファイルやdict以外はNone扱いで握りつぶす(表示側の耐性)"""
     try:
@@ -39,8 +51,12 @@ def report(game):
     payload["ts"] = time.time()
     d.mkdir(parents=True, exist_ok=True)
 
-    # typeを送らない旧クライアントはsaveキーの有無で振り分ける
+    # typeを送らない旧クライアントはsaveキーの有無で振り分ける。
+    # タイポ等の未知typeをreport扱いに落とすとsave便がlatest.jsonを潰す
+    # 事故が再発するため、save/report以外は明示的に拒否する
     kind = payload.get("type") or ("save" if "save" in payload else "report")
+    if kind not in ("save", "report"):
+        abort(400, description="type must be 'save' or 'report'")
 
     if kind == "save":
         # save便はセーブファイルの退避のみ。latest.json/historyには触れない
@@ -48,12 +64,12 @@ def report(game):
         save = payload.get("save")
         if not isinstance(save, str) or not save:
             abort(400, description="save string required")
-        (d / f"save_{today()}.txt").write_text(save, encoding="utf-8")
+        write_atomic(d / f"save_{today()}.txt", save)
         return jsonify(ok=True)
 
     payload.pop("save", None)
     line = json.dumps(payload, ensure_ascii=False)
-    (d / "latest.json").write_text(line, encoding="utf-8")
+    write_atomic(d / "latest.json", line)
     with (d / f"history_{today()}.jsonl").open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     return jsonify(ok=True)
@@ -74,7 +90,8 @@ def status():
 def history(game):
     """当日のreport履歴(ダッシュボードのグラフ用に間引いた形で返す)"""
     d = game_dir(game)
-    points = []
+    # 上限超過時はファイル先頭ではなく直近側を残す(グラフが凍らないように)
+    points = collections.deque(maxlen=HISTORY_LIMIT)
     path = d / f"history_{today()}.jsonl"
     if path.is_file():
         with path.open(encoding="utf-8", errors="replace") as f:
@@ -89,9 +106,7 @@ def history(game):
                         "cps": record.get("cps"),
                         "cookies": record.get("cookies"),
                     })
-                if len(points) >= HISTORY_LIMIT:
-                    break
-    return jsonify(points)
+    return jsonify(list(points))
 
 
 @app.get("/")
@@ -101,7 +116,8 @@ def index():
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Game Hub</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<!-- deferで読み込み、CDN不通/低速でもカード表示をブロックしない -->
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
   body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;
        margin:0;padding:1em;max-width:640px;margin-inline:auto}
@@ -113,6 +129,7 @@ def index():
   .card .value{font-size:1.5em;font-weight:700;margin-top:.15em;
                font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
   .chartbox{background:#16213e;border-radius:.6em;padding:.7em;margin-top:.6em;height:200px}
+  .chartnote{display:none;color:#9aa4c7;font-size:.8em;padding:.5em}
   .meta{font-size:.72em;color:#9aa4c7;margin-top:.4em}
   #empty{color:#9aa4c7}
 </style></head><body>
@@ -157,11 +174,21 @@ function section(game){
   const box = document.createElement('div');
   box.className = 'chartbox';
   const canvas = document.createElement('canvas');
-  box.appendChild(canvas); sec.appendChild(box);
+  const note = document.createElement('div');
+  note.className = 'chartnote';
+  note.textContent = 'グラフを表示できません(Chart.js 未読込)';
+  box.append(canvas, note); sec.appendChild(box);
   const meta = document.createElement('div');
   meta.className = 'meta'; sec.appendChild(meta);
   document.getElementById('games').appendChild(sec);
-  charts[game] = new Chart(canvas, {
+  return sec;
+}
+
+// Chart.js(defer/CDN)がまだ無ければ作らず、後続のrefreshで再試行する
+function ensureChart(game, sec){
+  if (charts[game]) return charts[game];
+  if (typeof Chart === 'undefined') return null;
+  charts[game] = new Chart(sec.querySelector('canvas'), {
     type:'line',
     data:{labels:[],datasets:[{data:[],borderColor:'#4cc9f0',
       backgroundColor:'rgba(76,201,240,.15)',fill:true,tension:.3,
@@ -173,7 +200,7 @@ function section(game){
         x:{ticks:{color:'#9aa4c7',maxTicksLimit:6},grid:{color:'#26305c'}},
         y:{ticks:{color:'#9aa4c7',callback:v=>fmt(v)},grid:{color:'#26305c'}}}}
   });
-  return sec;
+  return charts[game];
 }
 
 function updateCards(sec, rec){
@@ -189,11 +216,13 @@ function updateCards(sec, rec){
     ts ? '最終報告: ' + ts.toLocaleTimeString('ja-JP') : '';
 }
 
-async function updateChart(game){
+async function updateChart(game, sec){
+  const c = ensureChart(game, sec);
+  sec.querySelector('.chartnote').style.display = c ? 'none' : 'block';
+  if (!c) return;
   const res = await fetch('/history/' + encodeURIComponent(game));
   if (!res.ok) return;
   const points = (await res.json()).filter(p => typeof p.cps === 'number');
-  const c = charts[game];
   c.data.labels = points.map(p => new Date(p.ts*1000)
     .toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}));
   c.data.datasets[0].data = points.map(p => p.cps);
@@ -207,12 +236,17 @@ async function refresh(){
   const empty = document.getElementById('empty');
   if (empty && games.length) empty.remove();
   for (const game of games){
-    const sec = section(game);
-    updateCards(sec, st[game]);
-    await updateChart(game);
+    // 1ゲームの失敗(グラフ生成エラー等)で他ゲームの描画を止めない
+    try {
+      const sec = section(game);
+      updateCards(sec, st[game]);
+      await updateChart(game, sec);
+    } catch (e) { console.warn(e); }
   }
 }
 refresh(); setInterval(refresh, 30000);
+// defer読み込みのChart.jsが初回refresh後に間に合った場合の再描画
+window.addEventListener('load', refresh);
 </script></body></html>"""
 
 
