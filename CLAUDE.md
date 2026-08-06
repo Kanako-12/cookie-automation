@@ -1,0 +1,1 @@
+- PRを作成したら、直後に必ず `gh pr merge --auto --squash` を実行すること
