@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import re
+import sys
 
 LOG_DIR = "logs"
 
@@ -28,11 +29,19 @@ def load_reports(session):
         return []
     reports = []
     with open(path) as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            # 書き込み途中のプロセス停止等で壊れた行が混ざっても、残りの集計は続ける
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"warning: {path}:{lineno}: skipping malformed JSON line", file=sys.stderr)
+                continue
+            if not isinstance(record, dict):
+                print(f"warning: {path}:{lineno}: skipping non-object record", file=sys.stderr)
+                continue
             # save退避レコード(type: "save")は集計対象外。type未設定の旧形式は報告として扱う
             if record.get("type", "report") == "report":
                 reports.append(record)
