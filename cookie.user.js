@@ -70,6 +70,9 @@
   // --- 1s: 購入系(待ち時間込み回収期間ベースの貪欲法) ---
   every(1000, () => {
     // tech(黙示録研究)とtoggle(シーズン切替等)は自動購入しない
+    // buy(1)のbypassがスキップするのは確認ダイアログ(clickFunction)のみで、
+    // 支払いはbuy()内のcanBuy+Game.Spendで必ず発生する。ランプ払いだけは
+    // bypassで無償取得になるが、該当するSugar frenzyはtoggleなので除外済み
     Game.UpgradesInStore
       .filter(u => u.canBuy() && u.pool !== 'tech' && u.pool !== 'toggle')
       .sort((a, b) => a.getPrice() - b.getPrice())
