@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from collections import deque
 
 LOG_DIR = "logs"
 
@@ -22,12 +23,13 @@ def num(value):
     return value
 
 
-def load_reports(session):
+def load_reports(session, limit=0):
     path = os.path.join(LOG_DIR, session + ".jsonl")
     # まだ一度も報告が来ていないセッションはログファイル自体が無い
     if not os.path.exists(path):
         return []
-    reports = []
+    # limit指定時は直近limit件だけを保持し、長期セッションのログでもメモリを食わない
+    reports = deque(maxlen=limit) if limit else []
     # テキストモードだと行イテレータ自体がUnicodeDecodeErrorを投げ得るため、
     # バイナリで読み、行単位で独立にデコードして壊れた行だけをスキップする
     with open(path, "rb") as f:
@@ -51,7 +53,7 @@ def load_reports(session):
             # save退避レコード(type: "save")は集計対象外。type未設定の旧形式は報告として扱う
             if record.get("type", "report") == "report":
                 reports.append(record)
-    return reports
+    return list(reports)
 
 
 def average_cps(reports):
@@ -85,9 +87,7 @@ def main():
     if args.recent < 0:
         parser.error("--recent must be a nonnegative integer")
 
-    reports = load_reports(args.session)
-    if args.recent:
-        reports = reports[-args.recent:]
+    reports = load_reports(args.session, args.recent)
 
     if not reports:
         print("no reports found")
