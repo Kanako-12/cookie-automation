@@ -59,10 +59,11 @@ def load_reports(session, limit=0):
 def average_cps(reports):
     if not reports:
         return 0.0
-    total = 0
-    for r in reports:
-        total += num(r.get("cps"))
-    return total / len(reports)
+    # 単純合計だと巨大値(クリッカー系は指数的に伸びる)でinfに飽和し得るため逐次平均で計算する
+    mean = 0.0
+    for n, r in enumerate(reports, start=1):
+        mean += (num(r.get("cps")) - mean) / n
+    return mean
 
 
 def peak_cookies(reports):
