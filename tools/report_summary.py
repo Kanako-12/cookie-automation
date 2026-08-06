@@ -19,16 +19,22 @@ def load_reports(session):
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if line:
-                reports.append(json.loads(line))
+            if not line:
+                continue
+            record = json.loads(line)
+            # save退避レコード(type: "save")は集計対象外。type未設定の旧形式は報告として扱う
+            if record.get("type", "report") == "report":
+                reports.append(record)
     return reports
 
 
 def average_cps(reports):
+    if not reports:
+        return 0.0
     total = 0
-    for i in range(len(reports) - 1):
-        total += reports[i].get("cps", 0)
-    return total / (len(reports) - 1)
+    for r in reports:
+        total += r.get("cps", 0)
+    return total / len(reports)
 
 
 def peak_cookies(reports):
@@ -44,6 +50,9 @@ def main():
     parser.add_argument("--session", required=True, help="session name (log file stem)")
     parser.add_argument("--recent", type=int, default=0, help="only show the N most recent reports")
     args = parser.parse_args()
+
+    if args.recent < 0:
+        parser.error("--recent must be a nonnegative integer")
 
     reports = load_reports(args.session)
     if args.recent:
