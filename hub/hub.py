@@ -1,5 +1,5 @@
 from flask import Flask, abort, jsonify, request
-import collections, json, os, pathlib, re, tempfile, time
+import collections, json, math, os, pathlib, re, tempfile, time
 
 app = Flask(__name__)
 DATA = pathlib.Path.home() / "gamehub" / "data"
@@ -33,10 +33,19 @@ def write_atomic(path, text):
             os.unlink(tmp)
 
 
+def finite(value):
+    """非有限float(旧コードが書き残したInfinity/NaN)は標準JSONとして
+    再出力できず/statusごと壊すため、Noneに落とす"""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def read_json(path):
-    """壊れたファイルやdict以外はNone扱いで握りつぶす(表示側の耐性)"""
+    """壊れたファイル・dict以外・非有限数値入りはNone扱い(表示側の耐性)"""
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
+        json.dumps(record, allow_nan=False)  # 旧データのInfinity/NaN検出
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
@@ -110,9 +119,9 @@ def history(game):
                     continue
                 if isinstance(record, dict):
                     points.append({
-                        "ts": record.get("ts"),
-                        "cps": record.get("cps"),
-                        "cookies": record.get("cookies"),
+                        "ts": finite(record.get("ts")),
+                        "cps": finite(record.get("cps")),
+                        "cookies": finite(record.get("cookies")),
                     })
     return jsonify(list(points))
 
