@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -17,8 +18,11 @@ LOG_DIR = "logs"
 
 
 def num(value):
-    """JSONのnullやbool等、数値以外の値は0として扱う。"""
+    """JSONのnull・bool・非有限値(NaN/Infinity)等、有限の数値以外は0として扱う。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    # 巨大intはfloat変換なしで常に有限なので、floatのみ有限性を確認する
+    if isinstance(value, float) and not math.isfinite(value):
         return 0
     return value
 
