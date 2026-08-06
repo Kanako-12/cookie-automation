@@ -28,9 +28,15 @@ def load_reports(session):
     if not os.path.exists(path):
         return []
     reports = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, start=1):
-            line = line.strip()
+    # テキストモードだと行イテレータ自体がUnicodeDecodeErrorを投げ得るため、
+    # バイナリで読み、行単位で独立にデコードして壊れた行だけをスキップする
+    with open(path, "rb") as f:
+        for lineno, raw in enumerate(f, start=1):
+            try:
+                line = raw.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                print(f"warning: {path}:{lineno}: skipping non-UTF-8 line", file=sys.stderr)
+                continue
             if not line:
                 continue
             # 書き込み途中のプロセス停止等で壊れた行が混ざっても、残りの集計は続ける
