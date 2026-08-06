@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.0
+// @version      2.1
 // @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
 // @connect      lostworldproject
+// @noframes
 // @updateURL    https://raw.githubusercontent.com/Kanako-12/cookie-automation/main/cookie.user.js
 // @downloadURL  https://raw.githubusercontent.com/Kanako-12/cookie-automation/main/cookie.user.js
 // ==/UserScript==
@@ -21,54 +22,89 @@
       url: HUB,
       headers: { 'Content-Type': 'application/json' },
       data: JSON.stringify(payload),
+      timeout: 10000,
       onerror: () => console.warn('[gamehub] report failed'),
+      ontimeout: () => console.warn('[gamehub] report timed out'),
     });
   }
 
-  // --- 100ms: クリック系 ---
-  setInterval(() => {
-    if (typeof Game === 'undefined' || !Game.ready) return;
-    Game.ClickCookie();
-    // ゴールデンのみ回収、ラースは温存(黙示録は観測対象)
-    Game.shimmers
-      .filter(s => s.type === 'golden' && !s.wrath)
-      .forEach(s => s.pop());
-  }, 100);
+  // Game準備チェックと例外処理を共通化(1tickの失敗で以降が壊れないように)
+  function every(ms, fn) {
+    setInterval(() => {
+      if (typeof Game === 'undefined' || !Game.ready) return;
+      try { fn(); } catch (e) { console.warn('[gamehub]', e); }
+    }, ms);
+  }
 
-  // --- 1s: 購入系(回収期間ベースの貪欲法) ---
-  setInterval(() => {
-    if (typeof Game === 'undefined' || !Game.ready) return;
+  // Game.buyModeが売却側(-1)だとbuy()は建物を売ってしまうため、必ず購入モードで1個買う
+  function buyOne(building) {
+    const { buyMode, buyBulk } = Game;
+    Game.buyMode = 1;
+    Game.buyBulk = 1;
+    try {
+      building.buy(1);
+    } finally {
+      Game.buyMode = buyMode;
+      Game.buyBulk = buyBulk;
+    }
+  }
+
+  // --- 100ms: クリック系 ---
+  every(100, () => {
+    Game.ClickCookie();
+    // ゴールデン+トナカイのみ回収、ラースは温存(黙示録は観測対象)
+    // pop()はGame.shimmersから要素を抜くので、コピーしてから走査する
+    for (const s of [...Game.shimmers]) {
+      if ((s.type === 'golden' && !s.wrath) || s.type === 'reindeer') s.pop();
+    }
+    // ニュース欄のフォーチュンも回収
+    if (Game.TickerEffect && Game.TickerEffect.type === 'fortune') Game.tickerL.click();
+  });
+
+  // --- 1s: 購入系(待ち時間込み回収期間ベースの貪欲法) ---
+  every(1000, () => {
     // tech(黙示録研究)とtoggle(シーズン切替等)は自動購入しない
     Game.UpgradesInStore
       .filter(u => u.canBuy() && u.pool !== 'tech' && u.pool !== 'toggle')
+      .sort((a, b) => a.getPrice() - b.getPrice())
       .forEach(u => u.buy(1));
+
+    // 「貯まるまでの待ち時間+回収期間」が最短の建物を狙う。
+    // 最良候補にまだ手が届かない場合は安物を買わずに貯金する
+    const cps = Math.max(Game.cookiesPs, 1e-9);
     const best = Object.values(Game.Objects)
-      .filter(o => o.price <= Game.cookies)
-      .map(o => ({ o, pp: o.price / Math.max(o.storedCps * Game.globalCpsMult, 1e-9) }))
-      .sort((a, b) => a.pp - b.pp)[0];
-    if (best) best.o.buy(1);
-  }, 1000);
+      .map(o => {
+        const price = o.getPrice();
+        const gain = Math.max(o.storedCps * Game.globalCpsMult, 1e-9);
+        const wait = Math.max(price - Game.cookies, 0) / cps;
+        return { o, price, score: wait + price / gain };
+      })
+      .sort((a, b) => a.score - b.score)[0];
+    if (best && best.price <= Game.cookies) buyOne(best.o);
+  });
 
   // --- 60s: ハブへ進捗報告 ---
-  setInterval(() => {
-    if (typeof Game === 'undefined' || !Game.ready) return;
+  every(60000, () => {
     post({
+      type: 'report',
       cookies: Math.round(Game.cookies),
       cps: Math.round(Game.cookiesPs),
       buildings: Object.values(Game.Objects)
         .filter(o => o.amount > 0)
         .map(o => `${o.name}:${o.amount}`),
       elderWrath: Game.elderWrath,
+      wrinklers: Game.wrinklers.filter(w => w.phase > 0).length,
       upgrades: Game.UpgradesOwned,
+      prestige: Game.prestige,
     });
-  }, 60000);
+  });
 
   // --- 300s: セーブ退避 ---
-  setInterval(() => {
-    if (typeof Game === 'undefined' || !Game.ready) return;
+  every(300000, () => {
     post({
+      type: 'save',
       cookies: Math.round(Game.cookies),
       save: Game.WriteSave(1),
     });
-  }, 300000);
+  });
 })();
