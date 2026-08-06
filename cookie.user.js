@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.1
+// @version      2.1.1
 // @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
