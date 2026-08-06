@@ -23,6 +23,12 @@
       headers: { 'Content-Type': 'application/json' },
       data: JSON.stringify(payload),
       timeout: 10000,
+      // 401/500等はonerrorでなくonloadに来るため、ステータスも失敗判定する
+      onload: (res) => {
+        if (res.status < 200 || res.status >= 300) {
+          console.warn('[gamehub] report rejected: HTTP ' + res.status);
+        }
+      },
       onerror: () => console.warn('[gamehub] report failed'),
       ontimeout: () => console.warn('[gamehub] report timed out'),
     });
