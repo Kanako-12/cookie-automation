@@ -1,5 +1,5 @@
 from flask import Flask, abort, jsonify, request
-import collections, json, math, os, pathlib, re, tempfile, time
+import base64, collections, json, math, os, pathlib, re, tempfile, time
 
 app = Flask(__name__)
 DATA = pathlib.Path.home() / "gamehub" / "data"
@@ -9,6 +9,25 @@ GAME_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # 1日分のreport上限(60秒毎=1440件)より余裕を持った読み込み上限
 HISTORY_LIMIT = 3000
+
+# shot便(base64画像)が最大。デコード後上限+base64膨張分(4/3)より広めに取る
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+
+SHOT_DATAURL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
+SHOT_MAX_BYTES = 4 * 1024 * 1024
+# 形式ごとに別ファイル名にすると並行アップロード同士が互いのファイルを
+# 消し合えるため、単一の正準ファイルに書き、形式はマジックバイトで判定する
+SHOT_FILE = "shot.img"
+SHOT_FORMATS = ((b"\xff\xd8\xff", "image/jpeg"),
+                (b"\x89PNG\r\n\x1a\n", "image/png"))
+
+
+def shot_mime(raw):
+    """実データのマジックバイトからMIMEを決める(申告MIMEの偽装対策)"""
+    for magic, mime in SHOT_FORMATS:
+        if raw.startswith(magic):
+            return mime
+    return None
 
 
 def game_dir(game):
@@ -21,12 +40,14 @@ def today():
     return time.strftime("%Y%m%d")
 
 
-def write_atomic(path, text):
+def write_atomic(path, data):
     """並行リクエストで書きかけ同士が混ざらないよう一時ファイル経由で置き換える"""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -62,13 +83,13 @@ def report(game):
 
     # typeキー自体を送らない旧クライアントのみsaveキーの有無で振り分ける。
     # タイポや空文字などの不正typeをreport扱いに落とすとsave便が
-    # latest.jsonを潰す事故が再発するため、save/report以外は明示的に拒否する
+    # latest.jsonを潰す事故が再発するため、既知のtype以外は明示的に拒否する
     if "type" in payload:
         kind = payload["type"]
     else:
         kind = "save" if "save" in payload else "report"
-    if kind not in ("save", "report"):
-        abort(400, description="type must be 'save' or 'report'")
+    if kind not in ("save", "report", "shot"):
+        abort(400, description="type must be 'save', 'report' or 'shot'")
 
     if kind == "save":
         # save便はセーブファイルの退避のみ。latest.json/historyには触れない
@@ -77,6 +98,24 @@ def report(game):
         if not isinstance(save, str) or not save:
             abort(400, description="save string required")
         write_atomic(d / f"save_{today()}.txt", save)
+        return jsonify(ok=True)
+
+    if kind == "shot":
+        # shot便はスクショの保存のみ。latest.json/historyには触れない
+        shot = payload.get("shot")
+        m = SHOT_DATAURL.fullmatch(shot) if isinstance(shot, str) else None
+        if not m:
+            abort(400, description="shot must be a png/jpeg data URL")
+        try:
+            raw = base64.b64decode(m.group(1), validate=True)
+        except ValueError:
+            abort(400, description="invalid base64")
+        if len(raw) > SHOT_MAX_BYTES:
+            abort(413, description="image too large")
+        if shot_mime(raw) is None:
+            abort(400, description="image data is not png/jpeg")
+        # write_atomicのos.replaceで後勝ちになるため並行アップロードでも安全
+        write_atomic(d / SHOT_FILE, raw)
         return jsonify(ok=True)
 
     payload.pop("save", None)
@@ -92,6 +131,13 @@ def report(game):
     return jsonify(ok=True)
 
 
+def shot_mtime(d):
+    try:
+        return (d / SHOT_FILE).stat().st_mtime
+    except OSError:
+        return None
+
+
 @app.get("/status")
 def status():
     out = {}
@@ -99,8 +145,26 @@ def status():
         for g in sorted(DATA.iterdir()):
             record = read_json(g / "latest.json") if g.is_dir() else None
             if record is not None:
+                # クライアント申告でなくファイル実体から算出(表示側のキャッシュ更新判定用)
+                mtime = shot_mtime(g)
+                if mtime is not None:
+                    record["shotTs"] = mtime
                 out[g.name] = record
     return jsonify(out)
+
+
+@app.get("/shot/<game>")
+def shot(game):
+    d = game_dir(game)
+    try:
+        # 判定と送信の間で置換されても不整合にならないよう一度読み切る(上限4MB)
+        raw = (d / SHOT_FILE).read_bytes()
+    except OSError:
+        abort(404)
+    mime = shot_mime(raw)
+    if mime is None:
+        abort(404)  # 手動操作等で壊れたファイルが置かれていた場合
+    return app.response_class(raw, mimetype=mime)
 
 
 @app.get("/history/<game>")
@@ -147,6 +211,8 @@ def index():
                font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
   .chartbox{background:#16213e;border-radius:.6em;padding:.7em;margin-top:.6em;height:200px}
   .chartnote{display:none;color:#9aa4c7;font-size:.8em;padding:.5em}
+  .shot{display:none;width:100%;max-height:70vh;object-fit:contain;
+        background:#16213e;border-radius:.6em;margin-top:.6em}
   .meta{font-size:.72em;color:#9aa4c7;margin-top:.4em}
   #empty{color:#9aa4c7}
 </style></head><body>
@@ -197,6 +263,17 @@ function section(game){
   note.className = 'chartnote';
   note.textContent = 'グラフを表示できません(Chart.js 未読込)';
   box.append(canvas, note); sec.appendChild(box);
+  const img = document.createElement('img');
+  img.className = 'shot';
+  img.alt = 'screenshot';
+  // 読み込み成功時のみ表示(未送信・配信エラー時に壊れた画像アイコンを出さない)
+  img.addEventListener('load', () => { img.style.display = 'block'; });
+  img.addEventListener('error', () => {
+    img.style.display = 'none';
+    // 一時的な取得失敗を次回refreshで再試行できるよう読込済み判定を破棄
+    delete img.dataset.src;
+  });
+  sec.appendChild(img);
   const meta = document.createElement('div');
   meta.className = 'meta'; sec.appendChild(meta);
   document.getElementById('games').appendChild(sec);
@@ -213,11 +290,13 @@ function ensureChart(game, sec){
       backgroundColor:'rgba(76,201,240,.15)',fill:true,tension:.3,
       pointRadius:0,borderWidth:2}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
-      plugins:{legend:{display:false},title:{display:true,text:'CpS (today)',
-        color:'#9aa4c7',font:{size:11}}},
+      plugins:{legend:{display:false},title:{display:true,
+        text:'CpS (today, 対数目盛)',color:'#9aa4c7',font:{size:11}}},
       scales:{
         x:{ticks:{color:'#9aa4c7',maxTicksLimit:6},grid:{color:'#26305c'}},
-        y:{ticks:{color:'#9aa4c7',callback:v=>fmt(v)},grid:{color:'#26305c'}}}}
+        // CpSは日内でも桁が跳ね上がり線形軸だと序盤が潰れるため対数軸にする
+        y:{type:'logarithmic',ticks:{color:'#9aa4c7',maxTicksLimit:6,
+          callback:v=>fmt(v)},grid:{color:'#26305c'}}}}
   });
   return charts[game];
 }
@@ -231,8 +310,25 @@ function updateCards(sec, rec){
     el.textContent = v;
   }
   const ts = typeof rec.ts === 'number' ? new Date(rec.ts*1000) : null;
-  sec.querySelector('.meta').textContent =
-    ts ? '最終報告: ' + ts.toLocaleTimeString('ja-JP') : '';
+  let meta = ts ? '最終報告: ' + ts.toLocaleTimeString('ja-JP') : '';
+  if (typeof rec.shotTs === 'number'){
+    meta += (meta ? ' / ' : '') + 'スクショ: ' +
+      new Date(rec.shotTs*1000).toLocaleTimeString('ja-JP');
+  }
+  sec.querySelector('.meta').textContent = meta;
+}
+
+function updateShot(sec, game, rec){
+  const img = sec.querySelector('.shot');
+  if (typeof rec.shotTs !== 'number'){
+    img.style.display = 'none';
+    img.removeAttribute('src');
+    delete img.dataset.src;
+    return;
+  }
+  // shotTsをキャッシュバスタに使い、画像が更新された時だけ再取得する
+  const src = '/shot/' + encodeURIComponent(game) + '?t=' + rec.shotTs;
+  if (img.dataset.src !== src){ img.dataset.src = src; img.src = src; }
 }
 
 async function updateChart(game, sec){
@@ -241,7 +337,9 @@ async function updateChart(game, sec){
   if (!c) return;
   const res = await fetch('/history/' + encodeURIComponent(game));
   if (!res.ok) return;
-  const points = (await res.json()).filter(p => typeof p.cps === 'number');
+  // 対数軸は0以下を描画できないため除外する
+  const points = (await res.json())
+    .filter(p => typeof p.cps === 'number' && p.cps > 0);
   c.data.labels = points.map(p => new Date(p.ts*1000)
     .toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}));
   c.data.datasets[0].data = points.map(p => p.cps);
@@ -278,6 +376,7 @@ async function refresh(){
     try {
       const sec = section(game);
       updateCards(sec, st[game]);
+      updateShot(sec, game, st[game]);
       await updateChart(game, sec);
     } catch (e) { console.warn(e); }
   }
