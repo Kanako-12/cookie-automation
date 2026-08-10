@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.1.1
-// @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避
+// @version      2.2.0
+// @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避/スクショ送信
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
 // @connect      lostworldproject
@@ -114,6 +114,19 @@
       type: 'save',
       cookies: Math.round(Game.cookies),
       save: Game.WriteSave(1),
+    });
+  });
+
+  // --- 300s: スクショ送信 ---
+  // 左パネルのcanvas(大クッキー・ミルク・ワームの描画領域)を画像化して送る。
+  // ゴールデンクッキー等のDOM要素は写らない。canvas汚染等のtoDataURL例外は
+  // every()のtry/catchで握る
+  every(300000, () => {
+    const canvas = Game.LeftBackground && Game.LeftBackground.canvas;
+    if (!canvas || !canvas.width || !canvas.height) return;
+    post({
+      type: 'shot',
+      shot: canvas.toDataURL('image/jpeg', 0.7),
     });
   });
 })();
