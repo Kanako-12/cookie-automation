@@ -185,6 +185,7 @@ def history(game):
                     points.append({
                         "ts": finite(record.get("ts")),
                         "cps": finite(record.get("cps")),
+                        "baseCps": finite(record.get("baseCps")),
                         "cookies": finite(record.get("cookies")),
                     })
     return jsonify(list(points))
@@ -291,7 +292,7 @@ function ensureChart(game, sec){
       pointRadius:0,borderWidth:2}]},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
       plugins:{legend:{display:false},title:{display:true,
-        text:'CpS (today, 対数目盛)',color:'#9aa4c7',font:{size:11}}},
+        text:'ベースCpS (today, 対数目盛)',color:'#9aa4c7',font:{size:11}}},
       scales:{
         x:{ticks:{color:'#9aa4c7',maxTicksLimit:6},grid:{color:'#26305c'}},
         // CpSは日内でも桁が跳ね上がり線形軸だと序盤が潰れるため対数軸にする
@@ -337,12 +338,15 @@ async function updateChart(game, sec){
   if (!c) return;
   const res = await fetch('/history/' + encodeURIComponent(game));
   if (!res.ok) return;
+  // Frenzy等のバフによるスパイクで暴れないよう、バフ抜きのbaseCpsを描く。
+  // baseCps未対応の旧クライアントのreportはcpsで代用。
   // 対数軸は0以下を描画できないため除外する
   const points = (await res.json())
-    .filter(p => typeof p.cps === 'number' && p.cps > 0);
+    .map(p => ({ts: p.ts, v: typeof p.baseCps === 'number' ? p.baseCps : p.cps}))
+    .filter(p => typeof p.v === 'number' && p.v > 0);
   c.data.labels = points.map(p => new Date(p.ts*1000)
     .toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}));
-  c.data.datasets[0].data = points.map(p => p.cps);
+  c.data.datasets[0].data = points.map(p => p.v);
   c.update();
 }
 

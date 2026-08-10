@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.2.0
+// @version      2.3.0
 // @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避/スクショ送信
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
@@ -98,6 +98,8 @@
       type: 'report',
       cookies: Math.round(Game.cookies),
       cps: Math.round(Game.cookiesPs),
+      // Frenzy等のバフを除いたCpS(グラフ用。スパイクで暴れないベースライン)
+      baseCps: Math.round(Game.unbuffedCps),
       buildings: Object.values(Game.Objects)
         .filter(o => o.amount > 0)
         .map(o => `${o.name}:${o.amount}`),
