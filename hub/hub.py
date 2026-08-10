@@ -1,4 +1,4 @@
-from flask import Flask, abort, jsonify, request, send_file
+from flask import Flask, abort, jsonify, request
 import base64, collections, json, math, os, pathlib, re, tempfile, time
 
 app = Flask(__name__)
@@ -15,9 +15,19 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
 SHOT_DATAURL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
 SHOT_MAX_BYTES = 4 * 1024 * 1024
-# 拡張子はMIME申告でなく実データのマジックバイトで決める(偽装対策)
-SHOT_FORMATS = ((b"\xff\xd8\xff", "shot.jpg", "image/jpeg"),
-                (b"\x89PNG\r\n\x1a\n", "shot.png", "image/png"))
+# 形式ごとに別ファイル名にすると並行アップロード同士が互いのファイルを
+# 消し合えるため、単一の正準ファイルに書き、形式はマジックバイトで判定する
+SHOT_FILE = "shot.img"
+SHOT_FORMATS = ((b"\xff\xd8\xff", "image/jpeg"),
+                (b"\x89PNG\r\n\x1a\n", "image/png"))
+
+
+def shot_mime(raw):
+    """実データのマジックバイトからMIMEを決める(申告MIMEの偽装対策)"""
+    for magic, mime in SHOT_FORMATS:
+        if raw.startswith(magic):
+            return mime
+    return None
 
 
 def game_dir(game):
@@ -102,15 +112,11 @@ def report(game):
             abort(400, description="invalid base64")
         if len(raw) > SHOT_MAX_BYTES:
             abort(413, description="image too large")
-        for magic, name, _mime in SHOT_FORMATS:
-            if raw.startswith(magic):
-                write_atomic(d / name, raw)
-                # 前回と形式が変わった場合に古い方が残らないよう掃除
-                for _, other, _ in SHOT_FORMATS:
-                    if other != name:
-                        (d / other).unlink(missing_ok=True)
-                return jsonify(ok=True)
-        abort(400, description="image data is not png/jpeg")
+        if shot_mime(raw) is None:
+            abort(400, description="image data is not png/jpeg")
+        # write_atomicのos.replaceで後勝ちになるため並行アップロードでも安全
+        write_atomic(d / SHOT_FILE, raw)
+        return jsonify(ok=True)
 
     payload.pop("save", None)
     try:
@@ -126,12 +132,10 @@ def report(game):
 
 
 def shot_mtime(d):
-    for _, name, _ in SHOT_FORMATS:
-        try:
-            return (d / name).stat().st_mtime
-        except OSError:
-            continue
-    return None
+    try:
+        return (d / SHOT_FILE).stat().st_mtime
+    except OSError:
+        return None
 
 
 @app.get("/status")
@@ -152,14 +156,15 @@ def status():
 @app.get("/shot/<game>")
 def shot(game):
     d = game_dir(game)
-    for _, name, mime in SHOT_FORMATS:
-        p = d / name
-        if p.is_file():
-            try:
-                return send_file(p, mimetype=mime)
-            except OSError:
-                continue  # is_file直後の削除・置換と競合した場合
-    abort(404)
+    try:
+        # 判定と送信の間で置換されても不整合にならないよう一度読み切る(上限4MB)
+        raw = (d / SHOT_FILE).read_bytes()
+    except OSError:
+        abort(404)
+    mime = shot_mime(raw)
+    if mime is None:
+        abort(404)  # 手動操作等で壊れたファイルが置かれていた場合
+    return app.response_class(raw, mimetype=mime)
 
 
 @app.get("/history/<game>")
@@ -263,7 +268,11 @@ function section(game){
   img.alt = 'screenshot';
   // 読み込み成功時のみ表示(未送信・配信エラー時に壊れた画像アイコンを出さない)
   img.addEventListener('load', () => { img.style.display = 'block'; });
-  img.addEventListener('error', () => { img.style.display = 'none'; });
+  img.addEventListener('error', () => {
+    img.style.display = 'none';
+    // 一時的な取得失敗を次回refreshで再試行できるよう読込済み判定を破棄
+    delete img.dataset.src;
+  });
   sec.appendChild(img);
   const meta = document.createElement('div');
   meta.className = 'meta'; sec.appendChild(meta);
@@ -314,6 +323,7 @@ function updateShot(sec, game, rec){
   if (typeof rec.shotTs !== 'number'){
     img.style.display = 'none';
     img.removeAttribute('src');
+    delete img.dataset.src;
     return;
   }
   // shotTsをキャッシュバスタに使い、画像が更新された時だけ再取得する
