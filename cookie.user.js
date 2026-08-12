@@ -199,13 +199,16 @@
   // --- 10s: 昇天画面での買い物と転生(自動昇天オン時のみ) ---
   every(10000, () => {
     if (!hubConfig.autoAscend || !Game.OnAscend) return;
-    // ツリーの隣接条件(親を所持)を満たす天国アップグレードを安い順に買い切る。
-    // prestige poolのbuy()は隣接を確認しないため自前でparentsを見る
+    // ツリーの解禁条件を満たす天国アップグレードを安い順に買い切る。
+    // prestige poolのbuy()は解禁条件を再検証しないため、本体のBuildAscendTree
+    // と同じ条件を自前で確認する:全親の所持(AND)+showIf(Lucky digit系の
+    // 「prestigeに7を含む」等の出現条件)
     for (;;) {
       const next = Object.values(Game.Upgrades)
         .filter(u => u.pool === 'prestige' && !u.bought &&
           u.getPrice() <= Game.heavenlyChips &&
-          u.parents.every(p => p === -1 || p.bought))
+          u.parents.every(p => p === -1 || p.bought) &&
+          (!u.showIf || u.showIf()))
         .sort((a, b) => a.getPrice() - b.getPrice())[0];
       if (!next) break;
       next.buy();
