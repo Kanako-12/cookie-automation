@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.4.0
-// @description  自動クリック+購入+砂糖玉/黙示録/昇天の自動運用+Game Hubへの進捗報告/セーブ退避/スクショ送信
+// @version      2.5.0
+// @description  自動クリック+購入+砂糖玉/黙示録/昇天/ドラゴンの自動運用+Game Hubへの進捗報告/セーブ退避/スクショ送信
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
 // @connect      lostworldproject
@@ -233,6 +233,44 @@
     Game.Reincarnate(1);
   });
 
+  // --- 60s: ドラゴン育成 ---
+  // 昇天ごとにリセットされるKrumblorを自動で再育成する。
+  // 各訓練の生贄(建物100体等)は購入ループが買い戻すので、1tickに1段階だけ
+  // 進めて回復の時間を作る。オーラIDはmain.jsのdragonAuras定義に対応し、
+  // 解禁条件は本体SelectDragonAuraと同じ dragonLevel >= ID+4
+  const AURA = { BREATH_OF_MILK: 1, RADIANT_APPETITE: 15, DRAGON_GUTS: 21 };
+
+  // 本体のオーラ切替はUIプロンプト前提のため、Confirmボタンと同じ処理を
+  // ヘッドレスで行う(切替コスト=最高ティアの所持建物1体の生贄も同様に払う)
+  function setDragonAura(slot, auraId) {
+    const current = slot === 0 ? Game.dragonAura : Game.dragonAura2;
+    const other = slot === 0 ? Game.dragonAura2 : Game.dragonAura;
+    if (current === auraId || other === auraId) return;
+    if (Game.dragonLevel < auraId + 4) return; // 未習得のオーラ
+    let highest = null;
+    for (const o of Object.values(Game.Objects)) if (o.amount > 0) highest = o;
+    if (slot === 0) Game.dragonAura = auraId; else Game.dragonAura2 = auraId;
+    if (highest) highest.sacrifice(1);
+    Game.recalculateGains = 1;
+    Game.upgradesToRebuild = 1;
+  }
+
+  every(60000, () => {
+    if (!Game.Has('A crumbly egg')) return; // 卵はアップグレード自動購入が拾う
+    if (Game.dragonLevel < Game.dragonLevels.length - 1 &&
+        Game.dragonLevels[Game.dragonLevel].cost()) {
+      Game.UpgradeDragon();
+    }
+    // 第1スロット: 全生産×2のRadiant Appetite(習得までは繋ぎでBreath of Milk)
+    setDragonAura(0, Game.dragonLevel >= AURA.RADIANT_APPETITE + 4
+      ? AURA.RADIANT_APPETITE : AURA.BREATH_OF_MILK);
+    // 第2スロット(完全育成で解禁): リンクラー強化のDragon Guts
+    // (最大数+2と還元+20%が放牧と噛み合う)
+    if (Game.dragonLevel >= Game.dragonLevels.length - 1) {
+      setDragonAura(1, AURA.DRAGON_GUTS);
+    }
+  });
+
   // --- 60s: ハブへ進捗報告 ---
   every(60000, () => {
     post({
@@ -249,6 +287,7 @@
       upgrades: Game.UpgradesOwned,
       prestige: Game.prestige,
       lumps: Math.max(Game.lumps, 0), // 未解禁時は-1なので0に丸める
+      dragon: Game.dragonLevel,
     });
   });
 

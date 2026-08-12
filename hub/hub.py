@@ -270,6 +270,7 @@ const CARDS = [
   ['cookies','🍪 cookies'], ['cps','⚡ CpS'],
   ['elderWrath','👵 elderWrath'], ['wrinklers','🐛 wrinklers'],
   ['lumps','🍬 lumps'], ['prestige','👼 prestige'],
+  ['dragon','🐉 dragon Lv'],
 ];
 const WRATH = ['平穏','ざわめき','高まり','黙示録'];
 // game名 -> Chart。'constructor'等のgame名がプロトタイプと衝突しないよう
