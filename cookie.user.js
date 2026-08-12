@@ -181,18 +181,23 @@
   // 低prestige帯では数分おきの昇天ループになり得る)。
   // リンクラーの未回収分も判定に含め、
   // 条件を満たしたらまず全回収(shinyも。リセットで消えるため)して
-  // cookiesEarnedに実額を反映させ、次tickの再判定で昇天する
+  // cookiesEarnedに実額を反映させ、次tickで昇天する。回収は一度だけ:
+  // 回収後60秒の間に新しいリンクラーが吸い始めても(黙示録中は数十秒で
+  // 再湧きする)再回収でループせず、微少な新規分は諦めて昇天を優先する
+  let ascendCollected = false;
   every(60000, () => {
     if (!hubConfig.autoAscend) return;
     if (Game.OnAscend || Game.AscendTimer > 0 || Game.ReincarnateTimer > 0) return;
     const potential = Math.floor(Game.HowMuchPrestige(
       Game.cookiesReset + Game.cookiesEarned + wrinklerPayout()));
     const gained = potential - Game.prestige;
-    if (gained < Math.max(Game.prestige, 100)) return;
-    if (Game.wrinklers.some(w => w.phase > 0 && w.sucked > 0)) {
+    if (gained < Math.max(Game.prestige, 100)) { ascendCollected = false; return; }
+    if (!ascendCollected && Game.wrinklers.some(w => w.phase > 0 && w.sucked > 0)) {
+      ascendCollected = true;
       Game.CollectWrinklers();
       return;
     }
+    ascendCollected = false;
     Game.Ascend(1);
   });
 
