@@ -38,7 +38,9 @@
 
   // Hubのダッシュボードから切り替える設定。取得できるまでは安全側(昇天しない)
   let hubConfig = { autoAscend: false };
-  function fetchConfig() {
+  // onFreshは取得・反映に成功したときだけ呼ぶ。昇天のような不可逆な判定は
+  // このコールバック内で行い、古いhubConfigのまま実行しないよう直列化する
+  function fetchConfig(onFresh) {
     GM_xmlhttpRequest({
       method: 'GET',
       url: BASE + '/config/' + GAME,
@@ -48,12 +50,13 @@
         try {
           const c = JSON.parse(res.responseText);
           if (c && typeof c.autoAscend === 'boolean') hubConfig = c;
-        } catch (e) { /* 不正応答は無視して前回値を維持 */ }
+          else return;
+        } catch (e) { return; /* 不正応答は無視して前回値を維持 */ }
+        if (onFresh) onFresh();
       },
     });
   }
   fetchConfig();
-  setInterval(fetchConfig, 60000);
 
   // Game準備チェックと例外処理を共通化(1tickの失敗で以降が壊れないように)
   function every(ms, fn) {
@@ -185,7 +188,7 @@
   // 回収後60秒の間に新しいリンクラーが吸い始めても(黙示録中は数十秒で
   // 再湧きする)再回収でループせず、微少な新規分は諦めて昇天を優先する
   let ascendCollected = false;
-  every(60000, () => {
+  function maybeAscend() {
     // オフにしたら回収状態も破棄し、再有効化は新しい昇天試行として扱う
     // (回収直後にオフ→後日オンで、溜まった分を回収せず即昇天しないように)
     if (!hubConfig.autoAscend) { ascendCollected = false; return; }
@@ -201,7 +204,14 @@
     }
     ascendCollected = false;
     Game.Ascend(1);
-  });
+  }
+  // 昇天判定は設定取得の完了直後にだけ行う。独立タイマーだと切り替え反映前の
+  // 古い設定値で不可逆な昇天を実行し得るため直列化し、取得失敗時はそのtickの
+  // 判定自体を見送る(反映遅延はポーリング間隔の最大60秒に収まる)
+  setInterval(() => fetchConfig(() => {
+    if (typeof Game === 'undefined' || !Game.ready) return;
+    try { maybeAscend(); } catch (e) { console.warn('[gamehub]', e); }
+  }), 60000);
 
   // --- 10s: 昇天画面での買い物と転生(自動昇天オン時のみ) ---
   every(10000, () => {
