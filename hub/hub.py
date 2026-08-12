@@ -87,6 +87,10 @@ def read_config(d):
     return cfg
 
 
+# 認証について: このハブは家庭内LAN専用の前提で、全エンドポイントを
+# 無認証で提供する(reportやsave退避も同様)。設定POSTだけ認証しても
+# ダッシュボード自体が無認証では意味がないため、LAN外に公開する場合は
+# リバースプロキシ(Basic認証等)を手前に置くこと
 @app.get("/config/<game>")
 def get_config(game):
     return jsonify(read_config(game_dir(game)))
@@ -375,9 +379,10 @@ function updateCards(sec, rec){
     else v = fmt(v);
     el.textContent = v;
   }
-  // トグルは操作中(POST保存中)でなければサーバ値に同期する
+  // トグルはPOST保存中(disabled)でなければサーバ値に同期する。
+  // クリック後もフォーカスは残り続けるため、focus有無は同期の条件にしない
   const cb = sec.querySelector('.cfg input');
-  if (!cb.disabled && document.activeElement !== cb){
+  if (!cb.disabled){
     cb.checked = !!(rec.config && rec.config.autoAscend);
   }
   const ts = typeof rec.ts === 'number' ? new Date(rec.ts*1000) : null;
