@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.3.0
-// @description  自動クリック+回収期間ベース購入+Game Hubへの進捗報告/セーブ退避/スクショ送信
+// @version      2.4.0
+// @description  自動クリック+購入+砂糖玉/黙示録/昇天の自動運用+Game Hubへの進捗報告/セーブ退避/スクショ送信
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
 // @connect      lostworldproject
@@ -14,7 +14,9 @@
 (function () {
   'use strict';
 
-  const HUB = 'http://lostworldproject:8090/report/cookieclicker';
+  const BASE = 'http://lostworldproject:8090';
+  const GAME = 'cookieclicker';
+  const HUB = BASE + '/report/' + GAME;
 
   function post(payload) {
     GM_xmlhttpRequest({
@@ -33,6 +35,25 @@
       ontimeout: () => console.warn('[gamehub] report timed out'),
     });
   }
+
+  // Hubのダッシュボードから切り替える設定。取得できるまでは安全側(昇天しない)
+  let hubConfig = { autoAscend: false };
+  function fetchConfig() {
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: BASE + '/config/' + GAME,
+      timeout: 10000,
+      onload: (res) => {
+        if (res.status !== 200) return;
+        try {
+          const c = JSON.parse(res.responseText);
+          if (c && typeof c.autoAscend === 'boolean') hubConfig = c;
+        } catch (e) { /* 不正応答は無視して前回値を維持 */ }
+      },
+    });
+  }
+  fetchConfig();
+  setInterval(fetchConfig, 60000);
 
   // Game準備チェックと例外処理を共通化(1tickの失敗で以降が壊れないように)
   function every(ms, fn) {
@@ -58,7 +79,7 @@
   // --- 100ms: クリック系 ---
   every(100, () => {
     Game.ClickCookie();
-    // ゴールデン+トナカイのみ回収、ラースは温存(黙示録は観測対象)
+    // ゴールデン+トナカイのみ回収、ラースは放置(クリックしなければデバフもない)
     // pop()はGame.shimmersから要素を抜くので、コピーしてから走査する
     for (const s of [...Game.shimmers]) {
       if ((s.type === 'golden' && !s.wrath) || s.type === 'reindeer') s.pop();
@@ -67,14 +88,22 @@
     if (Game.TickerEffect && Game.TickerEffect.type === 'fortune') Game.tickerL.click();
   });
 
+  // --- 1s: 砂糖玉が完熟(ripe)したら即収穫 ---
+  // mature段階の収穫は50%で0個の博打なのでせず、確定になった瞬間に摘む。
+  // 放置落下と収量は同じだが、次の玉の成長がその分早く始まる
+  every(1000, () => {
+    if (Game.canLumps() && Date.now() - Game.lumpT >= Game.lumpRipeAge) Game.clickLump();
+  });
+
   // --- 1s: 購入系(待ち時間込み回収期間ベースの貪欲法) ---
   every(1000, () => {
-    // tech(黙示録研究)とtoggle(シーズン切替等)は自動購入しない
+    // toggle(シーズン切替・Elder Pledge/Covenant等)は自動購入しない。
+    // tech(黙示録研究)は購入対象:リンクラー放牧のため黙示録を自動進行させる。
     // buy(1)のbypassがスキップするのは確認ダイアログ(clickFunction)のみで、
     // 支払いはbuy()内のcanBuy+Game.Spendで必ず発生する。ランプ払いだけは
     // bypassで無償取得になるが、該当するSugar frenzyはtoggleなので除外済み
     Game.UpgradesInStore
-      .filter(u => u.canBuy() && u.pool !== 'tech' && u.pool !== 'toggle')
+      .filter(u => u.canBuy() && u.pool !== 'toggle')
       .sort((a, b) => a.getPrice() - b.getPrice())
       .forEach(u => u.buy(1));
 
@@ -92,6 +121,75 @@
     if (best && best.price <= Game.cookies) buyOne(best.o);
   });
 
+  // --- 60s: 砂糖玉の消費(建物レベル上げ) ---
+  // ミニゲーム解禁(農場/寺院/魔法塔/銀行をLv1)を最優先、以後は最低Lvの建物から。
+  // Sugar baking(未使用玉1個につき+1%CpS、100個まで)を持っていたら100個は温存
+  function lumpLevelUp(target) {
+    const ask = Game.prefs.askLumps;
+    Game.prefs.askLumps = 0; // spendLumpの確認ダイアログで止まらないよう一時的に外す
+    try { target.levelUp(); } finally { Game.prefs.askLumps = ask; }
+  }
+  every(60000, () => {
+    if (!Game.canLumps()) return;
+    const reserve = Game.Has('Sugar baking') ? 100 : 0;
+    const target =
+      ['Farm', 'Temple', 'Wizard tower', 'Bank']
+        .map(n => Game.Objects[n])
+        .find(o => o && o.amount > 0 && o.level < 1) ||
+      Object.values(Game.Objects)
+        .filter(o => o.amount > 0)
+        .sort((a, b) => a.level - b.level)[0];
+    // レベルアップ費用は現Lv+1個。温存分を割り込むなら見送り
+    if (target && Game.lumps - (target.level + 1) >= reserve) lumpLevelUp(target);
+  });
+
+  // --- 60s: リンクラー回収 ---
+  // 満員(通常10匹)まで貯めてから1時間ごとに一括回収(吸われた分が1.1倍で戻る)。
+  // 回収後の再湧き待ちの取りこぼしを減らすため高頻度では潰さない。
+  // レアなshinyリンクラー(type===1)は温存する
+  let wrinklersPoppedAt = Date.now();
+  every(60000, () => {
+    const active = Game.wrinklers.filter(w => w.phase > 0);
+    if (active.length < Game.getWrinklersMax()) return;
+    if (Date.now() - wrinklersPoppedAt < 3600e3) return;
+    for (const w of active) if (w.type === 0) w.hp = 0;
+    wrinklersPoppedAt = Date.now();
+  });
+
+  // --- 60s: 自動昇天(Hubのトグルがオンのときだけ) ---
+  // 「今昇天したら得られるプレステージ」が現在値と同量以上(=2倍化)になったら実行。
+  // 初回(prestige 0)は100貯まってから。昇天前にリンクラーを全回収して
+  // 吸われた分もプレステージ計算に反映させる(shinyも回収。リセットで消えるため)
+  every(60000, () => {
+    if (!hubConfig.autoAscend) return;
+    if (Game.OnAscend || Game.AscendTimer > 0 || Game.ReincarnateTimer > 0) return;
+    const potential = Math.floor(Game.HowMuchPrestige(Game.cookiesReset + Game.cookiesEarned));
+    const gained = potential - Game.prestige;
+    if (gained < Math.max(Game.prestige, 100)) return;
+    if (Game.wrinklers.some(w => w.phase > 0 && w.sucked > 0)) {
+      Game.CollectWrinklers(); // 回収分の反映を待って次tickで昇天判定し直す
+      return;
+    }
+    Game.Ascend(1);
+  });
+
+  // --- 10s: 昇天画面での買い物と転生(自動昇天オン時のみ) ---
+  every(10000, () => {
+    if (!hubConfig.autoAscend || !Game.OnAscend) return;
+    // ツリーの隣接条件(親を所持)を満たす天国アップグレードを安い順に買い切る。
+    // prestige poolのbuy()は隣接を確認しないため自前でparentsを見る
+    for (;;) {
+      const next = Object.values(Game.Upgrades)
+        .filter(u => u.pool === 'prestige' && !u.bought &&
+          u.getPrice() <= Game.heavenlyChips &&
+          u.parents.every(p => p === -1 || p.bought))
+        .sort((a, b) => a.getPrice() - b.getPrice())[0];
+      if (!next) break;
+      next.buy();
+    }
+    Game.Reincarnate(1);
+  });
+
   // --- 60s: ハブへ進捗報告 ---
   every(60000, () => {
     post({
@@ -107,6 +205,7 @@
       wrinklers: Game.wrinklers.filter(w => w.phase > 0).length,
       upgrades: Game.UpgradesOwned,
       prestige: Game.prestige,
+      lumps: Math.max(Game.lumps, 0), // 未解禁時は-1なので0に丸める
     });
   });
 

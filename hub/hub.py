@@ -10,6 +10,10 @@ GAME_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # 1日分のreport上限(60秒毎=1440件)より余裕を持った読み込み上限
 HISTORY_LIMIT = 3000
 
+# クライアントがポーリングする設定。キーはここに定義したものだけ受け付ける。
+# autoAscend: クライアントの自動昇天(既定オフ。ダッシュボードのトグルで切替)
+CONFIG_DEFAULTS = {"autoAscend": False}
+
 # shot便(base64画像)が最大。デコード後上限+base64膨張分(4/3)より広めに取る
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
@@ -70,6 +74,40 @@ def read_json(path):
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def read_config(d):
+    """保存済み設定に既定値をかぶせて返す(未知キー・型違いは無視)"""
+    stored = read_json(d / "config.json") or {}
+    cfg = dict(CONFIG_DEFAULTS)
+    for key, default in CONFIG_DEFAULTS.items():
+        value = stored.get(key)
+        if isinstance(value, type(default)):
+            cfg[key] = value
+    return cfg
+
+
+@app.get("/config/<game>")
+def get_config(game):
+    return jsonify(read_config(game_dir(game)))
+
+
+@app.post("/config/<game>")
+def set_config(game):
+    d = game_dir(game)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not payload:
+        abort(400, description="JSON object required")
+    cfg = read_config(d)
+    for key, value in payload.items():
+        if key not in CONFIG_DEFAULTS:
+            abort(400, description=f"unknown config key: {key}")
+        if not isinstance(value, type(CONFIG_DEFAULTS[key])):
+            abort(400, description=f"{key} must be {type(CONFIG_DEFAULTS[key]).__name__}")
+        cfg[key] = value
+    d.mkdir(parents=True, exist_ok=True)
+    write_atomic(d / "config.json", json.dumps(cfg))
+    return jsonify(cfg)
 
 
 @app.post("/report/<game>")
@@ -149,6 +187,7 @@ def status():
                 mtime = shot_mtime(g)
                 if mtime is not None:
                     record["shotTs"] = mtime
+                record["config"] = read_config(g)
                 out[g.name] = record
     return jsonify(out)
 
@@ -214,6 +253,9 @@ def index():
   .chartnote{display:none;color:#9aa4c7;font-size:.8em;padding:.5em}
   .shot{display:none;width:100%;max-height:70vh;object-fit:contain;
         background:#16213e;border-radius:.6em;margin-top:.6em}
+  .cfg{display:flex;align-items:center;gap:.5em;background:#16213e;
+       border-radius:.6em;padding:.6em .9em;margin-top:.6em;font-size:.85em}
+  .cfg input{accent-color:#4cc9f0;width:1.1em;height:1.1em}
   .meta{font-size:.72em;color:#9aa4c7;margin-top:.4em}
   #empty{color:#9aa4c7}
 </style></head><body>
@@ -223,6 +265,7 @@ def index():
 const CARDS = [
   ['cookies','🍪 cookies'], ['cps','⚡ CpS'],
   ['elderWrath','👵 elderWrath'], ['wrinklers','🐛 wrinklers'],
+  ['lumps','🍬 lumps'], ['prestige','👼 prestige'],
 ];
 const WRATH = ['平穏','ざわめき','高まり','黙示録'];
 // game名 -> Chart。'constructor'等のgame名がプロトタイプと衝突しないよう
@@ -257,6 +300,28 @@ function section(game){
     card.append(l,v); cards.appendChild(card);
   }
   sec.appendChild(cards);
+  // 自動昇天トグル。変更はサーバに保存し、クライアントが60秒毎に拾う
+  const cfg = document.createElement('label');
+  cfg.className = 'cfg';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.addEventListener('change', async () => {
+    cb.disabled = true;
+    try {
+      const res = await fetch('/config/' + encodeURIComponent(game), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({autoAscend: cb.checked}),
+      });
+      if (res.ok) cb.checked = !!(await res.json()).autoAscend;
+      else cb.checked = !cb.checked;  // 保存失敗時は表示を元に戻す
+    } catch (e) { cb.checked = !cb.checked; console.warn(e); }
+    cb.disabled = false;
+  });
+  const cfgText = document.createElement('span');
+  cfgText.textContent = '⛪ 自動昇天(プレステージ2倍化で実行)';
+  cfg.append(cb, cfgText);
+  sec.appendChild(cfg);
   const box = document.createElement('div');
   box.className = 'chartbox';
   const canvas = document.createElement('canvas');
@@ -309,6 +374,11 @@ function updateCards(sec, rec){
     if (key === 'elderWrath' && Number.isInteger(v) && WRATH[v]) v = WRATH[v];
     else v = fmt(v);
     el.textContent = v;
+  }
+  // トグルは操作中(POST保存中)でなければサーバ値に同期する
+  const cb = sec.querySelector('.cfg input');
+  if (!cb.disabled && document.activeElement !== cb){
+    cb.checked = !!(rec.config && rec.config.autoAscend);
   }
   const ts = typeof rec.ts === 'number' ? new Date(rec.ts*1000) : null;
   let meta = ts ? '最終報告: ' + ts.toLocaleTimeString('ja-JP') : '';
