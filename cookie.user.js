@@ -186,7 +186,9 @@
   // 再湧きする)再回収でループせず、微少な新規分は諦めて昇天を優先する
   let ascendCollected = false;
   every(60000, () => {
-    if (!hubConfig.autoAscend) return;
+    // オフにしたら回収状態も破棄し、再有効化は新しい昇天試行として扱う
+    // (回収直後にオフ→後日オンで、溜まった分を回収せず即昇天しないように)
+    if (!hubConfig.autoAscend) { ascendCollected = false; return; }
     if (Game.OnAscend || Game.AscendTimer > 0 || Game.ReincarnateTimer > 0) return;
     const potential = Math.floor(Game.HowMuchPrestige(
       Game.cookiesReset + Game.cookiesEarned + wrinklerPayout()));
