@@ -156,18 +156,38 @@
     wrinklersPoppedAt = Date.now();
   });
 
+  // リンクラーを今潰した場合の見込み還元額。main.jsのUpdateWrinklersの
+  // pop係数(1.1×Sacrilegious corruption×Dragon Gutsオーラ×shiny3倍×
+  // Wrinklerspawn)と同じ。Pantheonの神ボーナスのみ省略=控えめな見積もり
+  function wrinklerPayout() {
+    let total = 0;
+    for (const w of Game.wrinklers) {
+      if (w.phase > 0 && w.sucked > 0) {
+        let mult = 1.1;
+        if (Game.Has('Sacrilegious corruption')) mult *= 1.05;
+        mult *= 1 + Game.auraMult('Dragon Guts') * 0.2;
+        if (w.type === 1) mult *= 3;
+        if (Game.Has('Wrinklerspawn')) mult *= 1.05;
+        total += w.sucked * mult;
+      }
+    }
+    return total;
+  }
+
   // --- 60s: 自動昇天(Hubのトグルがオンのときだけ) ---
   // 「今昇天したら得られるプレステージ」が現在値と同量以上(=2倍化)になったら実行。
-  // 初回(prestige 0)は100貯まってから。昇天前にリンクラーを全回収して
-  // 吸われた分もプレステージ計算に反映させる(shinyも回収。リセットで消えるため)
+  // 初回(prestige 0)は100貯まってから。リンクラーの未回収分も判定に含め、
+  // 条件を満たしたらまず全回収(shinyも。リセットで消えるため)して
+  // cookiesEarnedに実額を反映させ、次tickの再判定で昇天する
   every(60000, () => {
     if (!hubConfig.autoAscend) return;
     if (Game.OnAscend || Game.AscendTimer > 0 || Game.ReincarnateTimer > 0) return;
-    const potential = Math.floor(Game.HowMuchPrestige(Game.cookiesReset + Game.cookiesEarned));
+    const potential = Math.floor(Game.HowMuchPrestige(
+      Game.cookiesReset + Game.cookiesEarned + wrinklerPayout()));
     const gained = potential - Game.prestige;
     if (gained < Math.max(Game.prestige, 100)) return;
     if (Game.wrinklers.some(w => w.phase > 0 && w.sucked > 0)) {
-      Game.CollectWrinklers(); // 回収分の反映を待って次tickで昇天判定し直す
+      Game.CollectWrinklers();
       return;
     }
     Game.Ascend(1);
