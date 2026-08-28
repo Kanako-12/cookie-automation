@@ -10,6 +10,10 @@ GAME_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # 1日分のreport上限(60秒毎=1440件)より余裕を持った読み込み上限
 HISTORY_LIMIT = 3000
 
+# KB級のリストを毎分historyに積むとファイルが肥大するため、これらのキーは
+# latest.json(現在値)にのみ残し、グラフ用のhistoryからは除く
+HISTORY_EXCLUDE = ("missingAchievements", "missingShadow")
+
 # クライアントがポーリングする設定。キーはここに定義したものだけ受け付ける。
 # autoAscend: クライアントの自動昇天(既定オフ。ダッシュボードのトグルで切替)
 CONFIG_DEFAULTS = {"autoAscend": False}
@@ -165,11 +169,13 @@ def report(game):
         # Infinity/NaN/1e999等はそのまま書くとlatest.jsonが不正JSONになり
         # /statusの応答ごと壊れてダッシュボード全体が止まるため拒否する
         line = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        slim = {k: v for k, v in payload.items() if k not in HISTORY_EXCLUDE}
+        history_line = json.dumps(slim, ensure_ascii=False, allow_nan=False)
     except ValueError:
         abort(400, description="non-finite numbers not allowed")
     write_atomic(d / "latest.json", line)
     with (d / f"history_{today()}.jsonl").open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+        f.write(history_line + "\n")
     return jsonify(ok=True)
 
 
@@ -260,6 +266,14 @@ def index():
   .cfg{display:flex;align-items:center;gap:.5em;background:#16213e;
        border-radius:.6em;padding:.6em .9em;margin-top:.6em;font-size:.85em}
   .cfg input{accent-color:#4cc9f0;width:1.1em;height:1.1em}
+  .achievs{background:#16213e;border-radius:.6em;padding:.6em .9em;
+           margin-top:.6em;font-size:.85em}
+  .achievs summary{cursor:pointer;color:#ffd166}
+  .achievs .chips{display:flex;flex-wrap:wrap;gap:.35em;margin-top:.6em}
+  .achievs .chip{background:#26305c;border-radius:.4em;padding:.15em .5em;
+                 font-size:.85em}
+  .achievs .chip.shadow{opacity:.55}
+  .achievs .grouplabel{width:100%;color:#9aa4c7;font-size:.8em;margin-top:.3em}
   .meta{font-size:.72em;color:#9aa4c7;margin-top:.4em}
   #empty{color:#9aa4c7}
 </style></head><body>
@@ -270,7 +284,7 @@ const CARDS = [
   ['cookies','🍪 cookies'], ['cps','⚡ CpS'],
   ['elderWrath','👵 elderWrath'], ['wrinklers','🐛 wrinklers'],
   ['lumps','🍬 lumps'], ['prestige','👼 prestige'],
-  ['dragon','🐉 dragon Lv'],
+  ['dragon','🐉 dragon Lv'], ['achievements','🏆 achievements'],
 ];
 const WRATH = ['平穏','ざわめき','高まり','黙示録'];
 // game名 -> Chart。'constructor'等のgame名がプロトタイプと衝突しないよう
@@ -334,6 +348,15 @@ function section(game){
   note.className = 'chartnote';
   note.textContent = 'グラフを表示できません(Chart.js 未読込)';
   box.append(canvas, note); sec.appendChild(box);
+  // 未取得実績の折りたたみリスト(実績ハント用チェックリスト)
+  const ach = document.createElement('details');
+  ach.className = 'achievs';
+  ach.style.display = 'none';
+  const sum = document.createElement('summary');
+  const chips = document.createElement('div');
+  chips.className = 'chips';
+  ach.append(sum, chips);
+  sec.appendChild(ach);
   const img = document.createElement('img');
   img.className = 'shot';
   img.alt = 'screenshot';
@@ -376,7 +399,11 @@ function updateCards(sec, rec){
   for (const el of sec.querySelectorAll('.value')){
     const key = el.dataset.key;
     let v = rec[key];
-    if (key === 'elderWrath' && Number.isInteger(v) && WRATH[v]) v = WRATH[v];
+    if (key === 'achievements' && typeof v === 'number' &&
+        typeof rec.achievementsTotal === 'number'){
+      v = fmt(v) + ' / ' + fmt(rec.achievementsTotal);
+    }
+    else if (key === 'elderWrath' && Number.isInteger(v) && WRATH[v]) v = WRATH[v];
     else v = fmt(v);
     el.textContent = v;
   }
@@ -393,6 +420,43 @@ function updateCards(sec, rec){
       new Date(rec.shotTs*1000).toLocaleTimeString('ja-JP');
   }
   sec.querySelector('.meta').textContent = meta;
+}
+
+// 実績ハント用の未取得リスト。実績名はtextContentで挿入(HTMLに混ぜない)
+function updateAchievements(sec, rec){
+  const box = sec.querySelector('.achievs');
+  const missing = Array.isArray(rec.missingAchievements)
+    ? rec.missingAchievements : null;
+  if (!missing){ box.style.display = 'none'; return; } // 旧クライアント
+  box.style.display = 'block';
+  const shadowMissing = Array.isArray(rec.missingShadow) ? rec.missingShadow : [];
+  let label = '🏆 未取得の実績 ' + missing.length + '件';
+  if (typeof rec.shadowOwned === 'number' && typeof rec.shadowTotal === 'number'){
+    label += '(シャドウ ' + rec.shadowOwned + '/' + rec.shadowTotal + ')';
+  }
+  sec.querySelector('.achievs summary').textContent = label;
+  // 内容が変わったときだけチップ群を組み直す(30秒ごとの全再構築を避ける)
+  const chips = sec.querySelector('.achievs .chips');
+  const sig = JSON.stringify([missing, shadowMissing]);
+  if (chips.dataset.sig === sig) return;
+  chips.dataset.sig = sig;
+  chips.textContent = '';
+  for (const name of missing){
+    const c = document.createElement('span');
+    c.className = 'chip'; c.textContent = name;
+    chips.appendChild(c);
+  }
+  if (shadowMissing.length){
+    const gl = document.createElement('div');
+    gl.className = 'grouplabel';
+    gl.textContent = 'シャドウ実績(milk対象外・任意)';
+    chips.appendChild(gl);
+    for (const name of shadowMissing){
+      const c = document.createElement('span');
+      c.className = 'chip shadow'; c.textContent = name;
+      chips.appendChild(c);
+    }
+  }
 }
 
 function updateShot(sec, game, rec){
@@ -456,6 +520,7 @@ async function refresh(){
     try {
       const sec = section(game);
       updateCards(sec, st[game]);
+      updateAchievements(sec, st[game]);
       updateShot(sec, game, st[game]);
       await updateChart(game, sec);
     } catch (e) { console.warn(e); }
