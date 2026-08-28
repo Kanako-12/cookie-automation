@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fable印・クッキー自動化 v2
 // @namespace    gamehub
-// @version      2.5.0
+// @version      2.6.0
 // @description  自動クリック+購入+砂糖玉/黙示録/昇天/ドラゴンの自動運用+Game Hubへの進捗報告/セーブ退避/スクショ送信
 // @match        https://orteil.dashnet.org/cookieclicker/*
 // @grant        GM_xmlhttpRequest
@@ -273,6 +273,11 @@
 
   // --- 60s: ハブへ進捗報告 ---
   every(60000, () => {
+    // 実績: milk対象(pool normal)の取得状況と未取得リスト(実績ハント用)。
+    // shadowはmilk対象外の挑戦枠なので別勘定にする
+    const achievs = Object.values(Game.Achievements);
+    const normal = achievs.filter(a => Game.CountsAsAchievementOwned(a.pool));
+    const shadow = achievs.filter(a => a.pool === 'shadow');
     post({
       type: 'report',
       cookies: Math.round(Game.cookies),
@@ -288,6 +293,12 @@
       prestige: Game.prestige,
       lumps: Math.max(Game.lumps, 0), // 未解禁時は-1なので0に丸める
       dragon: Game.dragonLevel,
+      achievements: Game.AchievementsOwned,
+      achievementsTotal: normal.length,
+      missingAchievements: normal.filter(a => !a.won).map(a => a.dname),
+      shadowOwned: shadow.filter(a => a.won).length,
+      shadowTotal: shadow.length,
+      missingShadow: shadow.filter(a => !a.won).map(a => a.dname),
     });
   });
 
