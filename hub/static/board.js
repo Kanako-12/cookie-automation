@@ -200,7 +200,12 @@ $('replyBtn').addEventListener('click', async () => {
 // ---- thread actions ----
 $('activeToggle').addEventListener('change', async () => {
   const cb = $('activeToggle'); cb.disabled = true;
-  try { await api('/board/threads/' + encodeURIComponent(current), {active: cb.checked}); }
+  try {
+    // サーバは archived のスレッドでは active を false に戻すので、表示は応答の値に合わせる
+    const t = await api('/board/threads/' + encodeURIComponent(current), {active: cb.checked});
+    cb.checked = t.active === true;
+    if (cb.checked !== (t.archived !== true) && t.archived) toast('アーカイブ済みのスレッドはAIの対象にできません');
+  }
   catch (e) { toast(e.message); cb.checked = !cb.checked; }
   cb.disabled = false; loadThreads().catch(console.warn);
 });
