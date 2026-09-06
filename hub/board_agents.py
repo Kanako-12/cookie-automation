@@ -20,7 +20,9 @@ DEFAULT_CONFIG = HERE.with_name("board_agents.json")
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 READ_LIMIT_DEFAULT = 30  # read_threadで返す直近件数(プロンプト膨張の防止)
 READ_LIMIT_MAX = 200
-ATTACH_TEXT_MAX = 3000   # テキスト系の添付を read_thread に載せる上限(文字数)
+ATTACH_TEXT_MAX = 3000   # テキスト系の添付1件を read_thread に載せる上限(文字数)
+ATTACH_TEXT_BUDGET = 12000  # 1回の read_thread に載せる添付テキストの合計上限(文字数)
+ATTACH_FETCH_LIMIT = 10  # 1回の read_thread で Hub から取りに行く添付の最大件数
 ATTACH_FETCH_MAX = 64 * 1024
 # hub.py の AUTHOR と同じ制約。名前は作業ディレクトリ名にも使うため "." / ".." は除外する
 AGENT_NAME = re.compile(r"(?!\.+$)[A-Za-z0-9_.-]{1,32}")
@@ -73,23 +75,33 @@ def format_thread(thread, hub=None, tid=None):
     if total > len(posts):
         lines.append(f"(直近{len(posts)}件のみ表示)")
     lines.append("")
-    for p in posts:
+    # 添付テキストは新しい投稿を優先し、件数と合計文字数に上限を設ける(プロンプト膨張と HTTP 連発の防止)
+    budget, fetches = ATTACH_TEXT_BUDGET, 0
+    for p in reversed(posts):
+        block = []
         ts = time.strftime("%m/%d %H:%M", time.localtime(p["ts"])) if isinstance(p.get("ts"), (int, float)) else ""
         model = f" ({p['model']})" if p.get("model") else ""
-        lines.append(f"#{p.get('n')} [{p.get('author')}{model}] {ts}")
+        block.append(f"#{p.get('n')} [{p.get('author')}{model}] {ts}")
         if p.get("body"):
-            lines.append(str(p.get("body", "")))
+            block.append(str(p.get("body", "")))
         for f in p.get("files") or []:
             if not isinstance(f, dict):
                 continue
             size = f.get("size") if isinstance(f.get("size"), int) else 0
-            lines.append(f"[添付: {f.get('name')} ({f.get('mime')}, {human_size(size)})]")
-            text = fetch_attachment_text(hub, tid, f) if hub and tid else None
-            if text is not None:
-                lines.append("--- 添付の内容 ---")
-                lines.append(text)
-                lines.append("--- ここまで ---")
-        lines.append("")
+            block.append(f"[添付: {f.get('name')} ({f.get('mime')}, {human_size(size)})]")
+            if not (hub and tid) or f.get("mime") != "text/plain" or fetches >= ATTACH_FETCH_LIMIT or budget <= 0:
+                continue
+            fetches += 1
+            text = fetch_attachment_text(hub, tid, f)
+            if text is None:
+                continue
+            if len(text) > budget:
+                text = text[:budget] + "\n…(以下省略)"
+            budget -= len(text)
+            block += ["--- 添付の内容 ---", text, "--- ここまで ---"]
+        block.append("")
+        lines[len(lines):len(lines)] = []  # no-op for clarity
+        lines.insert(4, "\n".join(block))  # 先頭4行(見出し)の直後に古い順で積む
     return "\n".join(lines).rstrip()
 
 

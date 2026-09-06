@@ -373,16 +373,14 @@ def attachment_mime(name, raw, declared):
     return "application/octet-stream"
 
 
-def save_attachments(tid, uploads):
-    """multipart の添付を保存してメタ情報のリストを返す(投稿 JSON に埋める)"""
+def prepare_attachments(uploads):
+    """multipart の添付を検証してメモリに読み込む(まだ書かない)。(meta, raw) のリストを返す"""
     uploads = [u for u in uploads if u and u.filename]
     if not uploads:
         return []
     if len(uploads) > ATTACH_PER_POST:
         abort(400, description=f"too many files (max {ATTACH_PER_POST})")
-    d = files_dir(tid)
-    d.mkdir(parents=True, exist_ok=True)
-    metas = []
+    items = []
     for u in uploads:
         raw = u.stream.read(ATTACH_MAX_BYTES + 1)
         if len(raw) > ATTACH_MAX_BYTES:
@@ -393,11 +391,27 @@ def save_attachments(tid, uploads):
         name = pathlib.PurePosixPath(u.filename.replace("\\", "/")).name.strip() or "file"
         name = re.sub(r"[\x00-\x1f]", "", name)[:ATTACH_NAME_MAX]
         fid = secrets.token_hex(8)
-        meta = {"id": fid, "name": name, "size": len(raw), "mime": attachment_mime(name, raw, u.mimetype)}
-        write_atomic(d / fid, raw)
-        write_atomic(d / f"{fid}.json", json.dumps(meta, ensure_ascii=False))
-        metas.append(meta)
-    return metas
+        items.append(({"id": fid, "name": name, "size": len(raw), "mime": attachment_mime(name, raw, u.mimetype)}, raw))
+    return items
+
+
+def write_attachments(tid, items):
+    """検証済みの添付を書く。途中で失敗したらこの投稿の分は全部消す"""
+    if not items:
+        return
+    d = files_dir(tid)
+    d.mkdir(parents=True, exist_ok=True)
+    written = []
+    try:
+        for meta, raw in items:
+            write_atomic(d / meta["id"], raw)
+            written.append(d / meta["id"])
+            write_atomic(d / f"{meta['id']}.json", json.dumps(meta, ensure_ascii=False))
+            written.append(d / f"{meta['id']}.json")
+    except OSError:
+        for path in written:
+            path.unlink(missing_ok=True)
+        abort(500, description="failed to store attachment")
 
 
 def read_attachment(tid, fid):
@@ -574,8 +588,10 @@ def board_post(tid):
         # 通し番号は末尾+1(欠番があっても単調増加にする)
         last_n = record["posts"][-1].get("n") if record["posts"] else 0
         n = (last_n if isinstance(last_n, int) else len(record["posts"])) + 1
-        files = save_attachments(tid, uploads)
-        post = make_post(payload, n, files)
+        # 添付と本文の検証を全部通してからファイルを書く(拒否された投稿の添付を残さない)
+        items = prepare_attachments(uploads)
+        post = make_post(payload, n, [meta for meta, _ in items])
+        write_attachments(tid, items)
         record["posts"].append(post)
         write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
     return jsonify(post), 201

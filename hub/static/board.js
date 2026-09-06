@@ -82,7 +82,7 @@ async function loadThreads(){
   if (!threads.length) current = null;
 }
 function selectThread(id){
-  if (id !== current) lastPostKey = '';
+  if (id !== current){ lastPostKey = ''; pending = []; renderPending(); }  // 添付待ちは別スレッドに持ち越さない
   current = id;
   history.replaceState(null, '', '#t=' + id);
   refresh();
