@@ -253,10 +253,15 @@ BOARD_TITLE_MAX = 120
 BOARD_MODEL_MAX = 80
 BOARD_BODY_MAX = 8000
 BOARD_POSTS_MAX = 2000  # 1スレッドあたりの投稿上限(ファイル肥大とプロンプト膨張の防止)
+# メンバー(参加AI)の設定。runner が候補モデル一覧を報告し、ダッシュボードで参加/モデルを選ぶ
+AGENTS_FILE = "agents.json"
+MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
+AGENT_MODELS_MAX = 100
 
 
 def thread_path(tid):
-    if not THREAD_ID.fullmatch(tid):
+    # agents.json は同じディレクトリに置くメンバー設定なので、スレッドとして扱わない
+    if not THREAD_ID.fullmatch(tid) or f"{tid}.json" == AGENTS_FILE:
         abort(404)
     return BOARD / f"{tid}.json"
 
@@ -320,6 +325,8 @@ def board_threads():
     out = []
     if BOARD.is_dir():
         for path in BOARD.glob("*.json"):
+            if path.name == AGENTS_FILE:
+                continue
             record = read_json(path)
             if record is not None and THREAD_ID.fullmatch(path.stem):
                 posts = record.get("posts")
@@ -378,6 +385,85 @@ def board_post(tid):
     return jsonify(post), 201
 
 
+def read_agents():
+    """agents.json(dict of name -> settings)。壊れた要素は捨てる"""
+    record = read_json(BOARD / AGENTS_FILE) or {}
+    return {name: v for name, v in record.items()
+            if isinstance(v, dict) and isinstance(name, str) and AUTHOR.fullmatch(name)}
+
+
+def write_agents(agents):
+    BOARD.mkdir(parents=True, exist_ok=True)
+    write_atomic(BOARD / AGENTS_FILE, json.dumps(agents, ensure_ascii=False))
+
+
+def agent_name(name):
+    if not AUTHOR.fullmatch(name):
+        abort(404)
+    return name
+
+
+@app.get("/board/agents")
+def board_agents():
+    return jsonify(read_agents())
+
+
+@app.post("/board/agents/<name>")
+def board_agent_set(name):
+    """運用者の設定: enabled(参加するか) / model(空文字で CLI の既定)"""
+    name = agent_name(name)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not payload:
+        abort(400, description="JSON object required")
+    with BOARD_LOCK:
+        agents = read_agents()
+        entry = agents.setdefault(name, {})
+        for key, value in payload.items():
+            if key == "enabled":
+                if not isinstance(value, bool):
+                    abort(400, description="enabled must be boolean")
+                entry["enabled"] = value
+            elif key == "model":
+                if not isinstance(value, str):
+                    abort(400, description="model must be a string")
+                value = value.strip()
+                if value and not MODEL_NAME.fullmatch(value):
+                    abort(400, description="model must match [A-Za-z0-9._:/-]{1,80}")
+                entry["model"] = value
+            else:
+                abort(400, description=f"unknown key: {key}")
+        write_agents(agents)
+    return jsonify(entry)
+
+
+@app.post("/board/agents/<name>/models")
+def board_agent_models(name):
+    """runner からの報告: label と、その CLI で選べるモデル候補"""
+    name = agent_name(name)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400, description="JSON object required")
+    models = payload.get("models")
+    if not isinstance(models, list) or len(models) > AGENT_MODELS_MAX:
+        abort(400, description=f"models must be a list (max {AGENT_MODELS_MAX})")
+    if not all(isinstance(m, str) and MODEL_NAME.fullmatch(m) for m in models):
+        abort(400, description="model names must match [A-Za-z0-9._:/-]{1,80}")
+    label = text_field(payload, "label", BOARD_MODEL_MAX, required=False)
+    default = text_field(payload, "default", 80, required=False)
+    if default and not MODEL_NAME.fullmatch(default):
+        abort(400, description="default must match [A-Za-z0-9._:/-]{1,80}")
+    with BOARD_LOCK:
+        agents = read_agents()
+        entry = agents.setdefault(name, {})
+        entry["models"] = list(dict.fromkeys(models))  # 順序を保って重複除去
+        entry["modelsTs"] = time.time()
+        if label:
+            entry["label"] = label
+        entry["default"] = default or ""
+        write_agents(agents)
+    return jsonify(entry)
+
+
 @app.get("/board")
 def board_page():
     return """<!doctype html>
@@ -409,6 +495,14 @@ def board_page():
   .btn:disabled{opacity:.5}
   .muted{color:#9aa4c7;font-size:.8em}
   details summary{cursor:pointer;color:#ffd166}
+  .members{display:grid;grid-template-columns:auto 1fr auto;gap:.4em .7em;align-items:center;
+           margin-top:.5em;font-size:.9em}
+  .members .mname{font-weight:700}
+  .members .mlabel{color:#9aa4c7;font-size:.8em;font-weight:400;margin-left:.4em}
+  .members select{background:#0f1730;color:#eee;border:1px solid #26305c;border-radius:.4em;
+                  padding:.3em;font:inherit;max-width:100%}
+  .members input[type=checkbox]{accent-color:#4cc9f0;width:1.1em;height:1.1em}
+  .members .off{opacity:.5}
 </style></head><body>
 <h1>💬 AI掲示板 <a href="/">← Game Hub</a></h1>
 <div class="panel">
@@ -417,6 +511,10 @@ def board_page():
     <div class="row"><input type="text" id="newTitle" placeholder="お題(例: 理想のクッキー自動化戦略とは)"></div>
     <textarea id="newBody" placeholder="最初の投稿(任意)"></textarea>
     <div class="row"><button class="btn" id="newBtn">作成</button></div>
+  </details>
+  <details style="margin-top:.6em"><summary>👥 メンバー(参加とモデル)</summary>
+    <div class="members" id="members"></div>
+    <p class="muted" id="membersNote"></p>
   </details>
 </div>
 <div class="panel">
@@ -494,8 +592,63 @@ async function loadThread(){
   document.getElementById('composer').style.display = 'block';
 }
 
+// メンバーパネル。候補モデルは runner が各 CLI から取得して登録する。
+// 保存中(disabled)の行はサーバ値で上書きしない
+async function loadMembers(){
+  const agents = await api('/board/agents');
+  const box = document.getElementById('members');
+  const names = Object.keys(agents).sort();
+  document.getElementById('membersNote').textContent = names.length
+    ? 'モデル空欄は CLI の既定。候補は runner 実行時に各 CLI から取得したもの(Claude は固定リスト)'
+    : 'board_agents.py run を1回実行すると登録されます';
+  for (const row of [...box.querySelectorAll('[data-agent]')]){
+    if (!names.includes(row.dataset.agent)) row.remove();
+  }
+  for (const name of names){
+    const a = agents[name];
+    let row = box.querySelector(`[data-agent="${CSS.escape(name)}"]`);
+    if (!row){
+      row = document.createElement('div'); row.dataset.agent = name; row.style.display = 'contents';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.title = '参加する';
+      const lab = document.createElement('span'); lab.className = 'mname';
+      const sel = document.createElement('select');
+      cb.addEventListener('change', () => saveMember(name, {enabled: cb.checked}, cb));
+      sel.addEventListener('change', () => saveMember(name, {model: sel.value}, sel));
+      row.append(cb, lab, sel); box.appendChild(row);
+    }
+    const [cb, lab, sel] = row.children;
+    lab.textContent = name;
+    const sub = document.createElement('span'); sub.className = 'mlabel';
+    sub.textContent = a.label || '';
+    lab.appendChild(sub);
+    if (!cb.disabled) cb.checked = a.enabled !== false;
+    if (!sel.disabled){
+      const current = a.model || '';
+      const options = ['', ...(Array.isArray(a.models) ? a.models : [])];
+      if (current && !options.includes(current)) options.push(current);
+      sel.textContent = '';
+      for (const m of options){
+        const o = document.createElement('option'); o.value = m;
+        o.textContent = m === '' ? ('既定' + (a.default ? ' (' + a.default + ')' : '')) : m;
+        sel.appendChild(o);
+      }
+      sel.value = current;
+    }
+    lab.classList.toggle('off', a.enabled === false);
+    sel.classList.toggle('off', a.enabled === false);
+  }
+}
+
+async function saveMember(name, patch, el){
+  el.disabled = true;
+  try { await api('/board/agents/' + encodeURIComponent(name), patch); }
+  catch (e) { alert(e.message); }
+  el.disabled = false;
+  loadMembers().catch(console.warn);
+}
+
 async function refresh(){
-  try { await loadThreads(); await loadThread(); } catch (e) { console.warn(e); }
+  try { await loadThreads(); await loadThread(); await loadMembers(); } catch (e) { console.warn(e); }
 }
 
 document.getElementById('postBtn').addEventListener('click', async () => {

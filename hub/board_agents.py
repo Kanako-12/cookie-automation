@@ -22,6 +22,8 @@ READ_LIMIT_DEFAULT = 30  # read_threadで返す直近件数(プロンプト膨�
 READ_LIMIT_MAX = 200
 # hub.py の AUTHOR と同じ制約。名前は作業ディレクトリ名にも使うため "." / ".." は除外する
 AGENT_NAME = re.compile(r"(?!\.+$)[A-Za-z0-9_.-]{1,32}")
+MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")  # hub.py の MODEL_NAME と同じ制約
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
 
 
 # ---------------------------------------------------------------- Hub client
@@ -204,6 +206,17 @@ def load_config(path):
         # label は任意。null や非文字列なら name で代用する
         if not isinstance(a.get("label"), str) or not a["label"]:
             a["label"] = a["name"]
+        # model_args: モデル指定時にコマンドの {model_args} に展開する引数(例 ["-m", "{model}"])
+        margs = a.get("model_args")
+        if margs is not None and (not isinstance(margs, list) or not margs
+                                  or not all(isinstance(x, str) for x in margs)):
+            sys.exit(f"config: agent {a['name']}: model_args must be a non-empty list of strings")
+        dm = a.get("default_model")
+        if dm is not None and (not isinstance(dm, str) or not MODEL_NAME.fullmatch(dm)):
+            sys.exit(f"config: agent {a['name']}: default_model must match [A-Za-z0-9._:/-]{{1,80}}")
+        spec = a.get("models")
+        if spec is not None and (not isinstance(spec, dict) or spec.get("type") not in MODEL_SOURCES):
+            sys.exit(f"config: agent {a['name']}: models.type must be one of {sorted(MODEL_SOURCES)}")
     cfg.setdefault("hub", "http://127.0.0.1:8090")
     cfg.setdefault("workdir", "~/gamehub/board_work")
     cfg.setdefault("timeout", 600)
@@ -216,6 +229,112 @@ def load_config(path):
             or not math.isfinite(timeout) or timeout <= 0):
         sys.exit("config: timeout must be a positive finite number of seconds")
     return cfg
+
+
+# ---------------------------------------------------------------- モデル候補
+def models_static(agent, spec):
+    return [m for m in spec.get("list", []) if isinstance(m, str)]
+
+
+def models_codex(agent, spec):
+    """`codex debug models` のカタログ JSON から slug を優先度順に取り出す"""
+    out = subprocess.run(spec.get("command") or ["codex", "debug", "models"], capture_output=True,
+                         text=True, timeout=60, stdin=subprocess.DEVNULL)
+    if out.returncode != 0:
+        raise RuntimeError(f"exit {out.returncode}: {out.stderr.strip()[-200:]}")
+    data = json.loads(out.stdout)
+    items = data if isinstance(data, list) else data.get("models", [])
+    items = [m for m in items if isinstance(m, dict) and isinstance(m.get("slug"), str)]
+    items.sort(key=lambda m: m.get("priority", 10**6) if isinstance(m.get("priority"), int) else 10**6)
+    # レビュー専用モデル等の会話用でない slug は除く
+    return [m["slug"] for m in items if "review" not in m["slug"]]
+
+
+def gemini_api_key():
+    key = os.environ.get("GEMINI_API_KEY")
+    if key:
+        return key
+    try:
+        for line in (pathlib.Path.home() / ".gemini" / ".env").read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == "GEMINI_API_KEY":
+                return v.strip().strip("'\"")
+    except OSError:
+        pass
+    return None
+
+
+def parse_gemini_models(data):
+    """models.list の応答から generateContent 対応の gemini-* だけを返す"""
+    names = []
+    for m in data.get("models", []) if isinstance(data, dict) else []:
+        name = m.get("name", "") if isinstance(m, dict) else ""
+        methods = m.get("supportedGenerationMethods", []) if isinstance(m, dict) else []
+        if name.startswith("models/gemini") and "generateContent" in methods:
+            names.append(name[len("models/"):])
+    return names
+
+
+def models_gemini_api(agent, spec):
+    key = gemini_api_key()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not found (env or ~/.gemini/.env)")
+    req = urllib.request.Request(GEMINI_MODELS_URL, headers={"x-goog-api-key": key})
+    with urllib.request.urlopen(req, timeout=20) as res:
+        return parse_gemini_models(json.loads(res.read().decode("utf-8")))
+
+
+MODEL_SOURCES = {"static": models_static, "codex": models_codex, "gemini-api": models_gemini_api}
+
+
+def discover_models(agent):
+    spec = agent.get("models")
+    if not spec:
+        return None
+    try:
+        models = MODEL_SOURCES[spec["type"]](agent, spec)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        print(f"  models for {agent['name']}: {e}", flush=True)
+        models = spec.get("fallback")
+        if not isinstance(models, list):
+            return None
+    return [m for m in models if isinstance(m, str) and MODEL_NAME.fullmatch(m)][:100]
+
+
+def sync_models(cfg):
+    """各 CLI で選べるモデル候補を Hub に登録する(ダッシュボードのプルダウン用)。失敗しても run は続ける"""
+    for agent in cfg["agents"]:
+        models = discover_models(agent)
+        payload = {"label": agent["label"], "models": models or [], "default": agent.get("default_model", "")}
+        try:
+            hub_request(cfg["hub"], f"/board/agents/{agent['name']}/models", payload)
+        except RuntimeError as e:
+            print(f"  models for {agent['name']}: {e}", flush=True)
+            continue
+        print(f"[board] {agent['name']}: {len(payload['models'])} model(s) registered", flush=True)
+
+
+def load_prefs(cfg):
+    """ダッシュボードで設定したメンバー設定(参加/モデル)。取れなければ空"""
+    try:
+        prefs = hub_request(cfg["hub"], "/board/agents")
+    except RuntimeError as e:
+        print(f"[board] member settings unavailable ({e}); using config defaults", flush=True)
+        return {}
+    return prefs if isinstance(prefs, dict) else {}
+
+
+def agent_model(agent, prefs):
+    pref = prefs.get(agent["name"])
+    model = pref.get("model") if isinstance(pref, dict) else None
+    if isinstance(model, str) and MODEL_NAME.fullmatch(model):
+        return model
+    return agent.get("default_model") or ""
+
+
+def agent_enabled(agent, prefs):
+    pref = prefs.get(agent["name"])
+    return not (isinstance(pref, dict) and pref.get("enabled") is False)
 
 
 def pick_thread(cfg, override):
@@ -261,9 +380,10 @@ def marker_path(wd):
     return wd / "posted.json"
 
 
-def mcp_argv(cfg, agent, tid, wd):
+def mcp_argv(cfg, agent, tid, wd, model=""):
+    label = agent["label"] + (f" / {model}" if model else "")
     return [sys.executable, str(HERE), "mcp", "--hub", cfg["hub"], "--thread", tid,
-            "--author", agent["name"], "--model", agent.get("label", agent["name"]),
+            "--author", agent["name"], "--model", label,
             "--marker", str(marker_path(wd))]
 
 
@@ -310,7 +430,7 @@ def prepare_workdir(wd, mcp_cmd):
     return wd
 
 
-def build_command(cfg, agent, tid, prompt, wd, mcp_cmd):
+def build_command(cfg, agent, tid, prompt, wd, mcp_cmd, model=""):
     subst = {
         "{prompt}": prompt,
         "{workdir}": str(wd),
@@ -324,6 +444,11 @@ def build_command(cfg, agent, tid, prompt, wd, mcp_cmd):
     }
     argv = []
     for arg in agent["command"]:
+        if arg == "{model_args}":
+            # モデル指定があるときだけ model_args(例 ["-m", "{model}"])を展開する
+            if model and agent.get("model_args"):
+                argv.extend(x.replace("{model}", model) for x in agent["model_args"])
+            continue
         for key, value in subst.items():
             arg = arg.replace(key, value)
         argv.append(arg)
@@ -338,8 +463,9 @@ def read_marker(marker):
     return posted if isinstance(posted, dict) else None
 
 
-def run_agent(cfg, agent, tid, dry_run):
+def run_agent(cfg, agent, tid, dry_run, prefs=None):
     agents = cfg["agents"]
+    model = agent_model(agent, prefs or {})
     participants = "、".join(a.get("label", a["name"]) for a in agents)
     try:
         prompt = cfg["prompt"].format(label=agent.get("label", agent["name"]),
@@ -347,13 +473,13 @@ def run_agent(cfg, agent, tid, dry_run):
     except (KeyError, IndexError, ValueError) as e:
         sys.exit(f"config: prompt template error ({e}); use {{label}} {{name}} {{participants}} {{thread}} only")
     wd = agent_workdir(cfg, agent)
-    mcp_cmd = mcp_argv(cfg, agent, tid, wd)
+    mcp_cmd = mcp_argv(cfg, agent, tid, wd, model)
     if not dry_run:
         # dry-run はロックを取らないので、実行中のCLIが読む設定ファイルには触れない
         prepare_workdir(wd, mcp_cmd)
-    argv = build_command(cfg, agent, tid, prompt, wd, mcp_cmd)
+    argv = build_command(cfg, agent, tid, prompt, wd, mcp_cmd, model)
     shown = " ".join(a if len(a) <= 40 else a[:37] + "..." for a in argv[:4])
-    print(f"[board] {agent['name']}: {shown} ... (cwd={wd})", flush=True)
+    print(f"[board] {agent['name']} (model={model or 'default'}): {shown} ... (cwd={wd})", flush=True)
     if dry_run:
         print("  " + json.dumps(argv, ensure_ascii=False), flush=True)
         return True
@@ -406,15 +532,24 @@ def run(args):
     cfg = load_config(args.config)
     agents = cfg["agents"]
     lock = acquire_lock(cfg) if not args.dry_run else None  # noqa: F841 - 保持が目的
+    prefs = {}
     try:
         tid = pick_thread(cfg, args.thread)
+        if not args.dry_run and not args.no_sync:
+            sync_models(cfg)
+        prefs = load_prefs(cfg)
         if args.agent:
-            order = [a for a in agents if a["name"] == args.agent]
+            order = [a for a in agents if a["name"] == args.agent]  # 手動指定は参加オフでも起動する
             if not order:
                 sys.exit(f"unknown agent: {args.agent}")
         else:
             start = agents.index(next_agent(agents, cfg, tid))
-            order = agents[start:] + agents[:start]
+            order = [a for a in agents[start:] + agents[:start] if agent_enabled(a, prefs)]
+            for a in agents:
+                if not agent_enabled(a, prefs):
+                    print(f"[board] {a['name']}: disabled in member settings, skipping", flush=True)
+            if not order:
+                sys.exit("no enabled agents (enable someone in the member settings on /board)")
     except RuntimeError as e:
         if not args.dry_run:
             sys.exit(str(e))
@@ -425,7 +560,7 @@ def run(args):
     try:
         for _ in range(args.rounds):
             for agent in order:
-                if not run_agent(cfg, agent, tid, args.dry_run):
+                if not run_agent(cfg, agent, tid, args.dry_run, prefs):
                     failures += 1
     except RuntimeError as e:
         sys.exit(str(e))
@@ -448,7 +583,11 @@ def main():
     r.add_argument("--agent", help="このAIだけ起動する")
     r.add_argument("--rounds", type=int, default=1, help="全員を何周させるか")
     r.add_argument("--dry-run", action="store_true", help="コマンドを表示するだけで起動しない")
+    r.add_argument("--no-sync", action="store_true", help="モデル候補の Hub への登録を省略する")
     r.set_defaults(func=run)
+    sm = sub.add_parser("sync-models", help="各 CLI で選べるモデル候補を Hub に登録する")
+    sm.add_argument("--config", default=str(DEFAULT_CONFIG))
+    sm.set_defaults(func=lambda a: sync_models(load_config(a.config)))
     args = ap.parse_args()
     args.func(args)
 
