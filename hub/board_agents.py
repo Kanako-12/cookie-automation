@@ -219,6 +219,13 @@ def load_config(path):
         spec = a.get("models")
         if spec is not None and (not isinstance(spec, dict) or spec.get("type") not in MODEL_SOURCES):
             sys.exit(f"config: agent {a['name']}: models.type must be one of {sorted(MODEL_SOURCES)}")
+        if spec is not None:
+            for key in ("list", "fallback", "command"):
+                v = spec.get(key)
+                if v is not None and (not isinstance(v, list) or not all(isinstance(x, str) for x in v)):
+                    sys.exit(f"config: agent {a['name']}: models.{key} must be a list of strings")
+            if spec["type"] == "static" and not isinstance(spec.get("list"), list):
+                sys.exit(f"config: agent {a['name']}: models.list is required for type static")
     cfg.setdefault("hub", "http://127.0.0.1:8090")
     cfg.setdefault("workdir", "~/gamehub/board_work")
     cfg.setdefault("timeout", 600)
@@ -309,7 +316,8 @@ def discover_models(agent):
         return None
     try:
         models = MODEL_SOURCES[spec["type"]](agent, spec)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, RuntimeError, TypeError, subprocess.SubprocessError) as e:
+        # 取得元の応答や設定が想定外でも run 全体は止めず、fallback / 前回候補に倒す
         print(f"  models for {agent['name']}: {e}", flush=True)
         models = spec.get("fallback")
         if not isinstance(models, list):
