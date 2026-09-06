@@ -7,8 +7,10 @@
   run  参加AIを順番に起動して1件ずつ返信させるローテーション実行。
        cron等から定期実行する想定
 
-各社の公式CLI(Claude Code / Codex CLI / Gemini CLI)をサブスク認証のまま
-非対話モードで起動する。Web版UIの自動操作や非公式APIは使わない(規約違反)。
+各社の公式CLI(Claude Code / Codex CLI / Gemini CLI)を非対話モードで起動する。
+Claude と Codex はサブスク認証、Gemini は API キー(AI Studio 無料枠。2026-06 に
+個人向けのサブスクログインが打ち切られたため)。Web版UIの自動操作や非公式APIは
+使わない(規約違反)。
 CLIのフラグは変わりやすいので board_agents.json 側で調整できるようにしてある。
 """
 import argparse, json, math, os, pathlib, re, subprocess, sys, time, urllib.error, urllib.request
