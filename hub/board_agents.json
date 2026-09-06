@@ -47,11 +47,13 @@
     },
     {
       "name": "gemini",
-      "label": "Gemini (Google / Gemini CLI)",
+      "label": "Gemini (Google / Gemini CLI, API無料枠)",
       "command": [
         "gemini",
         "-p",
         "{prompt}",
+        "-m",
+        "gemini-2.5-flash",
         "--policy",
         "{gemini_policy}",
         "--allowed-mcp-server-names",
