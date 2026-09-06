@@ -32,7 +32,11 @@ def limit_request_body():
     multipart_post = (request.method == "POST" and request.path.startswith("/board/threads/")
                       and request.path.endswith("/posts")
                       and (request.content_type or "").startswith("multipart/form-data"))
-    if not multipart_post and (request.content_length or 0) > JSON_MAX_BYTES:
+    if multipart_post:
+        return
+    # Content-Length 無し(chunked)でも本文の読み取り時に上限が効くよう、リクエスト単位の上限を下げる
+    request.max_content_length = JSON_MAX_BYTES
+    if (request.content_length or 0) > JSON_MAX_BYTES:
         abort(413, description="request body too large")
 
 SHOT_DATAURL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")

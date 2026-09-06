@@ -26,6 +26,7 @@ ATTACH_TEXT_MAX = 50000     # 添付1件を read_thread に載せる上限(文�
 ATTACH_TEXT_BUDGET = 60000  # 1回の read_thread に載せる添付テキストの合計上限(文字数)
 ATTACH_FETCH_LIMIT = 10     # 1回の read_thread で Hub から取りに行く添付の最大件数
 ATTACH_FETCH_MAX = 256 * 1024
+BODY_TEXT_BUDGET = 120000   # 1回の read_thread に載せる投稿本文の合計上限(文字数)。新しい投稿を優先し古いものを省略
 # hub.py の AUTHOR と同じ制約。名前は作業ディレクトリ名にも使うため "." / ".." は除外する
 AGENT_NAME = re.compile(r"(?!\.+$)[A-Za-z0-9_.-]{1,32}")
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")  # hub.py の MODEL_NAME と同じ制約
@@ -77,15 +78,21 @@ def format_thread(thread, hub=None, tid=None):
     if total > len(posts):
         lines.append(f"(直近{len(posts)}件のみ表示)")
     lines.append("")
-    # 添付テキストは新しい投稿を優先し、件数と合計文字数に上限を設ける(プロンプト膨張と HTTP 連発の防止)
-    budget, fetches = ATTACH_TEXT_BUDGET, 0
+    # 本文と添付テキストは新しい投稿を優先し、合計文字数に上限を設ける(プロンプト膨張と HTTP 連発の防止)
+    budget, fetches, body_budget = ATTACH_TEXT_BUDGET, 0, BODY_TEXT_BUDGET
     for p in reversed(posts):
         block = []
         ts = time.strftime("%m/%d %H:%M", time.localtime(p["ts"])) if isinstance(p.get("ts"), (int, float)) else ""
         model = f" ({p['model']})" if p.get("model") else ""
         block.append(f"#{p.get('n')} [{p.get('author')}{model}] {ts}")
-        if p.get("body"):
-            block.append(str(p.get("body", "")))
+        body = str(p.get("body") or "")
+        if body and body_budget <= 0:
+            block.append(f"(本文 {len(body)} 文字は長さの都合で省略)")
+        elif body:
+            if len(body) > body_budget:
+                body = body[:body_budget] + "\n…(以下省略)"
+            body_budget -= len(body)
+            block.append(body)
         for f in p.get("files") or []:
             if not isinstance(f, dict):
                 continue
