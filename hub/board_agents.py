@@ -23,6 +23,7 @@ READ_LIMIT_MAX = 200
 # hub.py の AUTHOR と同じ制約。名前は作業ディレクトリ名にも使うため "." / ".." は除外する
 AGENT_NAME = re.compile(r"(?!\.+$)[A-Za-z0-9_.-]{1,32}")
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")  # hub.py の MODEL_NAME と同じ制約
+POST_MODEL_MAX = 80  # hub.py の BOARD_MODEL_MAX と同じ(投稿のモデル欄の上限)
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
 
 
@@ -305,7 +306,11 @@ def sync_models(cfg):
     """各 CLI で選べるモデル候補を Hub に登録する(ダッシュボードのプルダウン用)。失敗しても run は続ける"""
     for agent in cfg["agents"]:
         models = discover_models(agent)
-        payload = {"label": agent["label"], "models": models or [], "default": agent.get("default_model", "")}
+        if models is None:
+            # 取得元が無い/一時的に失敗: Hub に残っている前回の候補を消さない
+            print(f"[board] {agent['name']}: model list not updated", flush=True)
+            continue
+        payload = {"label": agent["label"], "models": models, "default": agent.get("default_model", "")}
         try:
             hub_request(cfg["hub"], f"/board/agents/{agent['name']}/models", payload)
         except RuntimeError as e:
@@ -380,8 +385,17 @@ def marker_path(wd):
     return wd / "posted.json"
 
 
+def post_model_label(agent, model):
+    """投稿のモデル欄「ラベル / モデル名」。合計が hub の上限を超えるときはラベル側を削る"""
+    if not model:
+        return agent["label"][:POST_MODEL_MAX]
+    suffix = f" / {model}"
+    room = POST_MODEL_MAX - len(suffix)
+    return (agent["label"][:room] + suffix) if room > 0 else model[:POST_MODEL_MAX]
+
+
 def mcp_argv(cfg, agent, tid, wd, model=""):
-    label = agent["label"] + (f" / {model}" if model else "")
+    label = post_model_label(agent, model)
     return [sys.executable, str(HERE), "mcp", "--hub", cfg["hub"], "--thread", tid,
             "--author", agent["name"], "--model", label,
             "--marker", str(marker_path(wd))]
@@ -464,9 +478,11 @@ def read_marker(marker):
 
 
 def run_agent(cfg, agent, tid, dry_run, prefs=None):
-    agents = cfg["agents"]
-    model = agent_model(agent, prefs or {})
-    participants = "、".join(a.get("label", a["name"]) for a in agents)
+    prefs = prefs or {}
+    model = agent_model(agent, prefs)
+    # 参加者一覧は参加オンの AI だけ(--agent で手動起動した本人は必ず含める)
+    participants = "、".join(a["label"] for a in cfg["agents"]
+                            if a is agent or agent_enabled(a, prefs))
     try:
         prompt = cfg["prompt"].format(label=agent.get("label", agent["name"]),
                                       name=agent["name"], participants=participants, thread=tid)
