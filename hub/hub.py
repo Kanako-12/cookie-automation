@@ -20,8 +20,20 @@ HISTORY_EXCLUDE = ("missingAchievements", "missingShadow")
 # autoAscend: クライアントの自動昇天(既定オフ。ダッシュボードのトグルで切替)
 CONFIG_DEFAULTS = {"autoAscend": False}
 
-# 掲示板の添付(1投稿あたり最大 ATTACH_PER_POST × ATTACH_MAX_BYTES)と shot便(base64画像)を収める上限
-app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
+# 本文サイズの上限。掲示板の添付付き投稿(multipart)だけ大きく、それ以外(JSON の report/shot 等)は従来どおり
+# shot便(base64画像)がデコード後上限+base64膨張分(4/3)より広めに収まる 8MB
+JSON_MAX_BYTES = 8 * 1024 * 1024
+MULTIPART_MAX_BYTES = 60 * 1024 * 1024  # ATTACH_PER_POST × ATTACH_MAX_BYTES + 本文
+app.config["MAX_CONTENT_LENGTH"] = MULTIPART_MAX_BYTES
+
+
+@app.before_request
+def limit_request_body():
+    multipart_post = (request.method == "POST" and request.path.startswith("/board/threads/")
+                      and request.path.endswith("/posts")
+                      and (request.content_type or "").startswith("multipart/form-data"))
+    if not multipart_post and (request.content_length or 0) > JSON_MAX_BYTES:
+        abort(413, description="request body too large")
 
 SHOT_DATAURL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
 SHOT_MAX_BYTES = 4 * 1024 * 1024

@@ -273,7 +273,11 @@ $('deleteBtn').addEventListener('click', async () => {
   document.querySelector('details.menu').open = false;
   const t = threads.find(x => x.id === current);
   if (!confirm('スレッド「' + (t ? t.title : current) + '」を削除します。添付ファイルも消え、元に戻せません。よろしいですか?')) return;
-  try { await api('/board/threads/' + encodeURIComponent(current), undefined, 'DELETE'); current = null; lastPostKey = ''; history.replaceState(null, '', ' '); await refresh(); }
+  try {
+    await api('/board/threads/' + encodeURIComponent(current), undefined, 'DELETE');
+    current = null; lastPostKey = ''; pending = []; renderPending();  // 次に選ばれるスレッドへ添付を持ち越さない
+    history.replaceState(null, '', ' '); await refresh();
+  }
   catch (e) { toast(e.message); }
 });
 $('showArchived').addEventListener('change', () => {
@@ -312,25 +316,28 @@ $('fileInput').addEventListener('change', () => {
   }
   $('fileInput').value = ''; renderPending();
 });
+let sending = false;  // 送信中の二重送信防止(Enter の連打・キーリピート対策)
 async function sendPost(){
-  const btn = $('postBtn'), body = bodyBox.value.trim(), author = nameBox.value.trim() || 'human';
-  if (!current || (!body && !pending.length)) return;
-  btn.disabled = true;
+  const btn = $('postBtn'), author = nameBox.value.trim() || 'human';
+  const tid = current, rawBody = bodyBox.value, body = rawBody.trim(), files = pending.slice();
+  if (sending || !tid || (!body && !files.length)) return;
+  sending = true; btn.disabled = true;
   try {
-    if (pending.length){
+    if (files.length){
       const fd = new FormData(); fd.append('author', author); fd.append('body', body);
-      for (const f of pending) fd.append('files', f, f.name);
-      await api('/board/threads/' + encodeURIComponent(current) + '/posts', fd);
+      for (const f of files) fd.append('files', f, f.name);
+      await api('/board/threads/' + encodeURIComponent(tid) + '/posts', fd);
     } else {
-      await api('/board/threads/' + encodeURIComponent(current) + '/posts', {author, body});
+      await api('/board/threads/' + encodeURIComponent(tid) + '/posts', {author, body});
     }
-    bodyBox.value = ''; autoGrow(); pending = []; renderPending();
+    // 送信中に別スレッドへ移って書き始めた下書きは消さない。送った分だけ片付ける
+    if (bodyBox.value === rawBody){ bodyBox.value = ''; autoGrow(); }
+    pending = pending.filter(f => !files.includes(f)); renderPending();
     try { localStorage.setItem('boardName', author); } catch {}
-    lastPostKey = '';  // 自分の投稿は必ず末尾へスクロール
-    await refresh();
-    bodyBox.focus();
+    if (current === tid){ lastPostKey = ''; await refresh(); bodyBox.focus(); }  // 自分の投稿は必ず末尾へスクロール
+    else loadThreads().catch(console.warn);
   } catch (e) { toast(e.message); }
-  btn.disabled = false;
+  sending = false; btn.disabled = false;
 }
 $('postBtn').addEventListener('click', sendPost);
 $('newBtn').addEventListener('click', async () => {
