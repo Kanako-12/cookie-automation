@@ -40,6 +40,7 @@ let current = (location.hash.match(/^#t=([A-Za-z0-9_-]{1,64})$/) || [])[1] || nu
 let threads = [];
 let agents = {};
 let jobTimer = null;
+let loadSeq = 0;  // loadThread の世代番号。最後に開始した取得だけを描画する
 const $ = id => document.getElementById(id);
 const nameBox = $('name');
 try { nameBox.value = localStorage.getItem('boardName') || 'human'; } catch { nameBox.value = 'human'; }
@@ -83,9 +84,10 @@ async function loadThread(){
     $('toolbar').hidden = true; $('composer').hidden = true; $('posts').textContent = '';
     return;
   }
-  const tid = current;
+  const tid = current, seq = ++loadSeq;
   const t = await api('/board/threads/' + encodeURIComponent(tid));
-  if (current !== tid) return;  // 取得中に別スレッドへ切り替えた場合は古い応答を描画しない
+  // 取得中に別スレッドへ切り替えた、または同じスレッドをより新しく取得し直した場合は古い応答を描画しない
+  if (current !== tid || seq !== loadSeq) return;
   $('title').textContent = t.title;
   $('toolbar').hidden = false; $('composer').hidden = false;
   const active = $('activeToggle');
