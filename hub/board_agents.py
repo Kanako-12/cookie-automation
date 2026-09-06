@@ -28,9 +28,9 @@ GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pag
 
 
 # ---------------------------------------------------------------- Hub client
-def hub_request(hub, path, payload=None, timeout=15):
+def hub_request(hub, path, payload=None, timeout=15, method=None):
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(hub.rstrip("/") + path, data=data,
+    req = urllib.request.Request(hub.rstrip("/") + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"} if data else {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
@@ -272,13 +272,22 @@ def gemini_api_key():
 
 
 def parse_gemini_models(data):
-    """models.list の応答から generateContent 対応の gemini-* だけを返す"""
+    """models.list の応答から generateContent 対応の gemini-* だけを返す。
+    形式が想定外なら RuntimeError(取得失敗として fallback / 前回候補を使う)"""
+    items = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("unexpected models.list response (no model list)")
     names = []
-    for m in data.get("models", []) if isinstance(data, dict) else []:
-        name = m.get("name", "") if isinstance(m, dict) else ""
-        methods = m.get("supportedGenerationMethods", []) if isinstance(m, dict) else []
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        name, methods = m.get("name"), m.get("supportedGenerationMethods")
+        if not isinstance(name, str) or not isinstance(methods, list):
+            continue
         if name.startswith("models/gemini") and "generateContent" in methods:
             names.append(name[len("models/"):])
+    if not names:
+        raise RuntimeError("unexpected models.list response (no usable gemini models)")
     return names
 
 
@@ -324,6 +333,20 @@ def sync_models(cfg):
             continue
         print(f"[board] {agent['name']}: registered"
               + (f" ({len(models)} model(s))" if models is not None else " (model list not updated)"), flush=True)
+    # 設定から外れた(改名された)AI はメンバーパネルから消す
+    try:
+        stored = hub_request(cfg["hub"], "/board/agents")
+    except RuntimeError as e:
+        print(f"  member list unavailable ({e}); stale entries not pruned", flush=True)
+        return
+    names = {a["name"] for a in cfg["agents"]}
+    for name in (stored if isinstance(stored, dict) else {}):
+        if name not in names and AGENT_NAME.fullmatch(name):
+            try:
+                hub_request(cfg["hub"], f"/board/agents/{name}", method="DELETE")
+                print(f"[board] {name}: removed (not in config)", flush=True)
+            except RuntimeError as e:
+                print(f"  could not remove {name}: {e}", flush=True)
 
 
 def load_prefs(cfg):

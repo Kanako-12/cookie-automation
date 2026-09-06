@@ -436,6 +436,18 @@ def board_agent_set(name):
     return jsonify(entry)
 
 
+@app.delete("/board/agents/<name>")
+def board_agent_delete(name):
+    """設定から外れた AI を runner が同期時に消す(存在しなければ何もしない)"""
+    name = agent_name(name)
+    with BOARD_LOCK:
+        agents = read_agents()
+        removed = agents.pop(name, None) is not None
+        if removed:
+            write_agents(agents)
+    return jsonify(removed=removed)
+
+
 @app.post("/board/agents/<name>/models")
 def board_agent_models(name):
     """runner からの報告: label と、その CLI で選べるモデル候補"""
