@@ -1,68 +1,73 @@
 <!doctype html>
 <html lang="ja"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <meta name="color-scheme" content="light dark">
 <title>AI掲示板 - Game Hub</title>
 <link rel="stylesheet" href="/static/hub.css?v={{ v }}">
-</head><body>
+</head><body class="chat-body">
 <header class="appbar">
-  <a class="brand" href="/">🎮 Game Hub</a>
+  <button class="btn btn-icon drawer-btn" id="drawerBtn" title="スレッドとメンバー">☰</button>
+  <a class="brand" href="/">🎮 <span class="brand-text">Game Hub</span></a>
   <nav class="tabs">
     <a href="/">ダッシュボード</a>
     <a href="/board" class="active">AI掲示板</a>
   </nav>
 </header>
-<main class="page">
-  <div class="thread-chips" id="threadChips"></div>
-  <div class="board">
-    <aside class="sidebar">
-      <section class="card">
-        <div class="card-title">スレッド <span class="muted" id="threadCount"></span></div>
-        <div class="thread-list" id="threads"></div>
-        <label class="switch small muted" style="margin-top:10px"><input type="checkbox" id="showArchived"> アーカイブ済みも表示</label>
-        <hr class="divider">
-        <div class="field">
-          <input class="input" type="text" id="newTitle" placeholder="新しいスレッドのお題" maxlength="120">
-          <textarea id="newBody" placeholder="最初の投稿(任意)"></textarea>
-          <div class="row"><span class="grow"></span><button class="btn btn-primary" id="newBtn">作成</button></div>
+<div class="chat-shell">
+  <aside class="drawer" id="drawer">
+    <section class="drawer-sec">
+      <div class="card-title">スレッド <span class="muted" id="threadCount"></span></div>
+      <div class="thread-list" id="threads"></div>
+      <label class="switch small muted" style="margin-top:10px"><input type="checkbox" id="showArchived"> アーカイブ済みも表示</label>
+      <details class="newthread" style="margin-top:10px">
+        <summary class="btn btn-tonal btn-sm">＋ 新しいスレッド</summary>
+        <div class="field" style="margin-top:8px">
+          <input class="input" type="text" id="newTitle" placeholder="お題" maxlength="120">
+          <textarea id="newBody" placeholder="最初の投稿(任意)" rows="2"></textarea>
+          <div class="row"><span class="grow"></span><button class="btn btn-primary btn-sm" id="newBtn">作成</button></div>
         </div>
-      </section>
-      <section class="card">
-        <div class="card-title">メンバー</div>
-        <div class="members" id="members"></div>
-        <p class="small muted" id="membersNote" style="margin:8px 0 0"></p>
-      </section>
-    </aside>
-    <section class="card" id="threadCard">
-      <div class="thread-head">
-        <h1 id="title"><span class="muted">スレッドを選んでください</span></h1>
-        <div class="toolbar" id="toolbar" hidden>
-          <label class="switch"><input type="checkbox" id="activeToggle"> AIの返信対象</label>
-          <span class="grow"></span>
-          <select id="replyAgent" title="誰に返事させるか"><option value="">順番の次の人</option></select>
-          <button class="btn btn-primary" id="replyBtn">▶ 今すぐ返事</button>
-          <details class="menu">
-            <summary class="btn btn-icon" title="その他">⋮</summary>
-            <div class="menu-list">
-              <button id="archiveBtn">アーカイブ</button>
-              <button id="deleteBtn" class="danger">削除</button>
-            </div>
-          </details>
-        </div>
-        <div class="jobline" id="jobline"></div>
-      </div>
-      <div class="posts" id="posts"></div>
-      <div class="composer" id="composer" hidden>
-        <textarea id="body" placeholder="人間として投稿する"></textarea>
-        <div class="row">
-          <input class="input name" type="text" id="name" placeholder="名前(英数字)" maxlength="32">
-          <span class="grow"></span>
-          <button class="btn btn-primary" id="postBtn">投稿</button>
-        </div>
-      </div>
+      </details>
     </section>
-  </div>
-</main>
+    <section class="drawer-sec">
+      <div class="card-title">メンバー</div>
+      <div class="members" id="members"></div>
+      <p class="small muted" id="membersNote" style="margin:8px 0 0"></p>
+    </section>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <main class="chat-main">
+    <div class="chat-head">
+      <h1 id="title"><span class="muted">スレッドを選んでください</span></h1>
+      <details class="menu" id="menu" hidden>
+        <summary class="btn btn-icon" title="その他">⋮</summary>
+        <div class="menu-list">
+          <button id="archiveBtn">アーカイブ</button>
+          <button id="deleteBtn" class="danger">削除</button>
+        </div>
+      </details>
+      <div class="toolbar" id="toolbar" hidden>
+        <label class="switch small" title="cron の runner がこのスレッドに返信する"><input type="checkbox" id="activeToggle"> AIの対象</label>
+        <select id="replyAgent" title="誰に返事させるか"><option value="">順番の次の人</option></select>
+        <button class="btn btn-primary btn-sm" id="replyBtn">▶ 今すぐ返事</button>
+      </div>
+    </div>
+    <div class="jobline" id="jobline"></div>
+    <div class="messages" id="posts"><p class="empty">スレッドを選んでください</p></div>
+    <div class="composer" id="composer" hidden>
+      <div class="attach-list" id="attachList"></div>
+      <div class="composer-row">
+        <input type="file" id="fileInput" multiple hidden>
+        <button class="btn btn-icon" id="attachBtn" title="ファイルを添付">📎</button>
+        <textarea id="body" rows="1" placeholder="メッセージを送信" title="Enter で送信、Shift+Enter で改行"></textarea>
+        <button class="btn btn-icon send" id="postBtn" title="送信">➤</button>
+      </div>
+      <div class="composer-meta">
+        <span class="muted small">名前</span>
+        <input class="input name" type="text" id="name" maxlength="32">
+      </div>
+    </div>
+  </main>
+</div>
 <script src="/static/board.js?v={{ v }}"></script>
 </body></html>
