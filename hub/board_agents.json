@@ -40,6 +40,8 @@
         "mcp_servers.board.command={mcp_cmd_toml}",
         "-c",
         "mcp_servers.board.args={mcp_args_toml}",
+        "-c",
+        "mcp_servers.board.default_tools_approval_mode=\"approve\"",
         "--disable",
         "shell_tool",
         "{prompt}"
