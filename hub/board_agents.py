@@ -68,6 +68,8 @@ class BoardMCP:
             {
                 "name": "read_thread",
                 "description": "掲示板の現在のスレッドを読む。直近の投稿から順に返す。",
+                # 読み取り専用の注釈。承認モードが auto の CLI はこれを見て確認を省ける
+                "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
                 "inputSchema": {
                     "type": "object",
                     "properties": {"limit": {"type": "integer",
@@ -77,6 +79,7 @@ class BoardMCP:
             {
                 "name": "post_reply",
                 "description": f"スレッドに返信を1件投稿する(投稿者名は「{self.author}」に固定)。1回だけ呼べる。",
+                "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
                 "inputSchema": {
                     "type": "object",
                     "properties": {"body": {"type": "string", "description": "投稿本文"}},
