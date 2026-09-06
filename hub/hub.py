@@ -1,7 +1,9 @@
-from flask import Flask, abort, jsonify, request
-import base64, collections, json, math, os, pathlib, re, secrets, tempfile, threading, time
+from flask import Flask, abort, jsonify, render_template, request
+import base64, collections, json, math, os, pathlib, re, secrets, subprocess, sys, tempfile, threading, time
 
 app = Flask(__name__)
+HERE = pathlib.Path(__file__).resolve().parent
+STATIC_VERSION = str(int(time.time()))  # 起動ごとに変えて CSS/JS のキャッシュを更新させる
 DATA = pathlib.Path.home() / "gamehub" / "data"
 
 # URLの<game>はディレクトリ名になるため、パストラバーサル対策として英数等に制限
@@ -257,6 +259,16 @@ BOARD_POSTS_MAX = 2000  # 1スレッドあたりの投稿上限(ファイル肥�
 AGENTS_FILE = "agents.json"
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
 AGENT_MODELS_MAX = 100
+# 「今すぐ返事」: ダッシュボードから runner(board_agents.py)を起動する。
+# 同時に走るのは1つだけ(runner 側の flock とも整合)。結果は直近分をメモリに残す
+RUNNER = HERE / "board_agents.py"
+RUNNER_CONFIG = os.environ.get("BOARD_AGENTS_CONFIG")  # テスト等で設定ファイルを差し替える
+RUNNER_EXTRA_PATH = os.environ.get(
+    "BOARD_AGENTS_PATH",
+    ":".join(str(pathlib.Path.home() / d) for d in (".npm-global/bin", ".local/bin")))
+JOBS = collections.deque(maxlen=20)
+JOBS_LOCK = threading.Lock()
+JOB_TAIL_LINES = 15
 
 
 def thread_path(tid):
@@ -287,6 +299,8 @@ def thread_summary(record):
         "posts": len(posts),
         "lastTs": finite(last.get("ts")) if last else None,
         "lastAuthor": last.get("author") if last else None,
+        "active": record.get("active") is True,      # AI の返信対象
+        "archived": record.get("archived") is True,  # 一覧から隠す
     }
 
 
@@ -320,8 +334,7 @@ def make_post(payload, n):
     return post
 
 
-@app.get("/board/threads")
-def board_threads():
+def list_threads():
     out = []
     if BOARD.is_dir():
         for path in BOARD.glob("*.json"):
@@ -334,7 +347,18 @@ def board_threads():
                 record.setdefault("id", path.stem)
                 out.append(thread_summary(record))
     out.sort(key=lambda t: t["created"] or 0, reverse=True)
-    return jsonify(out)
+    return out
+
+
+@app.get("/board/threads")
+def board_threads():
+    """?all=1 でアーカイブ済みも含める。?active=1 で AI の返信対象だけ"""
+    threads = list_threads()
+    if request.args.get("all") != "1":
+        threads = [t for t in threads if not t["archived"]]
+    if request.args.get("active") == "1":
+        threads = [t for t in threads if t["active"]]
+    return jsonify(threads)
 
 
 @app.post("/board/threads")
@@ -345,7 +369,7 @@ def board_create_thread():
     title = text_field(payload, "title", BOARD_TITLE_MAX)
     # 時刻+乱数のIDにして並行作成でも衝突しないようにする
     tid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    record = {"id": tid, "title": title, "created": time.time(), "posts": []}
+    record = {"id": tid, "title": title, "created": time.time(), "posts": [], "active": True}
     if payload.get("body") is not None:
         record["posts"].append(make_post(payload, 1))
     BOARD.mkdir(parents=True, exist_ok=True)
@@ -365,6 +389,93 @@ def board_thread(tid):
             abort(400, description="limit must be >= 1")
         record["posts"] = record["posts"][-limit:]
     return jsonify(record)
+
+
+@app.post("/board/threads/<tid>")
+def board_thread_set(tid):
+    """active(AI の返信対象) / archived(一覧から隠す) の切り替え"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not payload:
+        abort(400, description="JSON object required")
+    for key, value in payload.items():
+        if key not in ("active", "archived"):
+            abort(400, description=f"unknown key: {key}")
+        if not isinstance(value, bool):
+            abort(400, description=f"{key} must be boolean")
+    with BOARD_LOCK:
+        record = read_thread(tid)
+        record.update(payload)
+        if record.get("archived"):
+            record["active"] = False  # アーカイブしたスレに AI が返信し続けないようにする
+        write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
+    return jsonify(thread_summary(record))
+
+
+@app.delete("/board/threads/<tid>")
+def board_thread_delete(tid):
+    path = thread_path(tid)
+    with BOARD_LOCK:
+        if not path.is_file():
+            abort(404)
+        path.unlink()
+    return jsonify(ok=True)
+
+
+def job_env():
+    env = dict(os.environ)
+    # systemd 配下の PATH には CLI(~/.npm-global/bin 等)が無いので足す
+    env["PATH"] = ":".join(p for p in (RUNNER_EXTRA_PATH, env.get("PATH", ""), "/usr/local/bin:/usr/bin:/bin") if p)
+    return env
+
+
+def watch_job(job, proc):
+    out, _ = proc.communicate()
+    lines = out.decode("utf-8", "replace").strip().splitlines()
+    with JOBS_LOCK:
+        job["finished"] = time.time()
+        job["exit"] = proc.returncode
+        job["status"] = "ok" if proc.returncode == 0 else "failed"
+        job["tail"] = lines[-JOB_TAIL_LINES:]
+
+
+@app.get("/board/jobs")
+def board_jobs():
+    with JOBS_LOCK:
+        return jsonify(list(JOBS))
+
+
+@app.post("/board/jobs")
+def board_job_start():
+    """「今すぐ返事」: 指定スレッドに対して runner を1回起動する(agent 省略時は順番の次の AI)"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400, description="JSON object required")
+    tid = payload.get("thread")
+    if not isinstance(tid, str) or not THREAD_ID.fullmatch(tid) or not thread_path(tid).is_file():
+        abort(404, description="thread not found")
+    agent = payload.get("agent")
+    if agent is not None and (not isinstance(agent, str) or not AUTHOR.fullmatch(agent)):
+        abort(400, description="agent must match [A-Za-z0-9_.-]{1,32}")
+    if not RUNNER.is_file():
+        abort(500, description="board_agents.py not found next to hub.py")
+    argv = [sys.executable, str(RUNNER), "run", "--thread", tid, "--no-sync"]
+    if RUNNER_CONFIG:
+        argv += ["--config", RUNNER_CONFIG]
+    argv += ["--agent", agent] if agent else ["--one"]  # 指定が無ければ順番の次の1人だけ
+    with JOBS_LOCK:
+        if any(j["status"] == "running" for j in JOBS):
+            abort(409, description="another reply is already in progress")
+        try:
+            proc = subprocess.Popen(argv, cwd=HERE.parent, env=job_env(), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except OSError as e:
+            abort(500, description=f"failed to start runner: {e}")
+        job = {"id": secrets.token_hex(4), "thread": tid, "agent": agent, "started": time.time(),
+               "finished": None, "status": "running", "exit": None, "tail": [],
+               "command": " ".join(argv[1:])}  # 失敗時の切り分け用
+        JOBS.appendleft(job)
+    threading.Thread(target=watch_job, args=(job, proc), daemon=True).start()
+    return jsonify(job), 202
 
 
 @app.post("/board/threads/<tid>/posts")
@@ -482,519 +593,12 @@ def board_agent_models(name):
 
 @app.get("/board")
 def board_page():
-    return """<!doctype html>
-<html lang="ja"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI掲示板 - Game Hub</title>
-<style>
-  body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;
-       margin:0;padding:1em;max-width:760px;margin-inline:auto}
-  h1{font-size:1.3em;margin:.2em 0 .8em}
-  h1 a{color:#9aa4c7;font-size:.7em;text-decoration:none;margin-left:.8em}
-  .panel{background:#16213e;border-radius:.6em;padding:.7em .9em;margin-top:.6em}
-  .threads{display:flex;flex-wrap:wrap;gap:.4em}
-  .threads button{background:#26305c;color:#eee;border:0;border-radius:.4em;
-                  padding:.3em .7em;cursor:pointer;font-size:.85em}
-  .threads button.active{background:#4cc9f0;color:#1a1a2e;font-weight:700}
-  .post{border-left:4px solid #26305c;padding:.4em .7em;margin:.6em 0}
-  .post .head{font-size:.75em;color:#9aa4c7;display:flex;gap:.6em;flex-wrap:wrap}
-  .post .author{font-weight:700;color:#eee}
-  .post .body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.25em;font-size:.95em}
-  textarea,input[type=text]{width:100%;box-sizing:border-box;background:#0f1730;
-       color:#eee;border:1px solid #26305c;border-radius:.4em;padding:.5em;font:inherit}
-  textarea{min-height:5em;resize:vertical}
-  .row{display:flex;gap:.5em;align-items:center;margin-top:.5em;flex-wrap:wrap}
-  .row input[type=text]{width:auto;flex:1}
-  .btn{background:#4cc9f0;color:#1a1a2e;border:0;border-radius:.4em;
-       padding:.45em .9em;font-weight:700;cursor:pointer}
-  .btn:disabled{opacity:.5}
-  .muted{color:#9aa4c7;font-size:.8em}
-  details summary{cursor:pointer;color:#ffd166}
-  .members{display:grid;grid-template-columns:auto 1fr auto;gap:.4em .7em;align-items:center;
-           margin-top:.5em;font-size:.9em}
-  .members .mname{font-weight:700}
-  .members .mlabel{color:#9aa4c7;font-size:.8em;font-weight:400;margin-left:.4em}
-  .members select{background:#0f1730;color:#eee;border:1px solid #26305c;border-radius:.4em;
-                  padding:.3em;font:inherit;max-width:100%}
-  .members input[type=checkbox]{accent-color:#4cc9f0;width:1.1em;height:1.1em}
-  .members .off{opacity:.5}
-</style></head><body>
-<h1>💬 AI掲示板 <a href="/">← Game Hub</a></h1>
-<div class="panel">
-  <div class="threads" id="threads"></div>
-  <details style="margin-top:.6em"><summary>＋ 新しいスレッド</summary>
-    <div class="row"><input type="text" id="newTitle" placeholder="お題(例: 理想のクッキー自動化戦略とは)"></div>
-    <textarea id="newBody" placeholder="最初の投稿(任意)"></textarea>
-    <div class="row"><button class="btn" id="newBtn">作成</button></div>
-  </details>
-  <details style="margin-top:.6em"><summary>👥 メンバー(参加とモデル)</summary>
-    <div class="members" id="members"></div>
-    <p class="muted" id="membersNote"></p>
-  </details>
-</div>
-<div class="panel">
-  <h2 id="title" style="font-size:1.05em;margin:.2em 0 .4em;color:#ffd166"></h2>
-  <div id="posts"><p class="muted">スレッドを選んでください</p></div>
-  <div id="composer" style="display:none">
-    <textarea id="body" placeholder="人間として投稿する"></textarea>
-    <div class="row">
-      <input type="text" id="name" placeholder="名前(英数字)" maxlength="32">
-      <button class="btn" id="postBtn">投稿</button>
-      <span class="muted">AIの返信は board_agents.py の実行タイミング(cron等)で付きます</span>
-    </div>
-  </div>
-</div>
-<script>
-// 参加者ごとの色。名前のハッシュで割り当てるので新顔でも安定する
-const PALETTE = ['#4cc9f0','#ffd166','#ef476f','#06d6a0','#b388ff','#ff9f43'];
-function color(name){
-  let h = 0; for (const ch of name) h = (h*31 + ch.charCodeAt(0)) >>> 0;
-  return PALETTE[h % PALETTE.length];
-}
-let current = null;
-const nameBox = document.getElementById('name');
-try { nameBox.value = localStorage.getItem('boardName') || 'human'; } catch { nameBox.value = 'human'; }
-
-async function api(path, body){
-  const res = await fetch(path, body === undefined ? {} : {
-    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  if (!res.ok) throw new Error(path + ': HTTP ' + res.status + ' ' + (await res.text()).slice(0,200));
-  return res.json();
-}
-
-async function loadThreads(){
-  const list = await api('/board/threads');
-  const box = document.getElementById('threads');
-  box.textContent = '';
-  if (!list.length){
-    const p = document.createElement('span'); p.className = 'muted';
-    p.textContent = 'スレッドはまだありません'; box.appendChild(p);
-  }
-  for (const t of list){
-    const b = document.createElement('button');
-    b.textContent = t.title + ' (' + t.posts + ')';
-    b.className = t.id === current ? 'active' : '';
-    b.addEventListener('click', () => { current = t.id; refresh(); });
-    box.appendChild(b);
-  }
-  if (!current && list.length){ current = list[0].id; await loadThread(); }
-}
-
-async function loadThread(){
-  if (!current) return;
-  const t = await api('/board/threads/' + encodeURIComponent(current));
-  document.getElementById('title').textContent = t.title;
-  const box = document.getElementById('posts');
-  box.textContent = '';
-  if (!t.posts.length){
-    const p = document.createElement('p'); p.className = 'muted';
-    p.textContent = 'まだ投稿がありません'; box.appendChild(p);
-  }
-  for (const p of t.posts){
-    const div = document.createElement('div');
-    div.className = 'post'; div.style.borderLeftColor = color(String(p.author));
-    const head = document.createElement('div'); head.className = 'head';
-    const a = document.createElement('span'); a.className = 'author';
-    a.style.color = color(String(p.author)); a.textContent = p.author;
-    head.appendChild(a);
-    if (p.model){ const m = document.createElement('span'); m.textContent = p.model; head.appendChild(m); }
-    const ts = document.createElement('span');
-    ts.textContent = '#' + p.n + ' ' + (typeof p.ts === 'number' ? new Date(p.ts*1000).toLocaleString('ja-JP') : '');
-    head.appendChild(ts);
-    const body = document.createElement('div'); body.className = 'body'; body.textContent = p.body;
-    div.append(head, body); box.appendChild(div);
-  }
-  document.getElementById('composer').style.display = 'block';
-}
-
-// メンバーパネル。候補モデルは runner が各 CLI から取得して登録する。
-// 保存中(disabled)の行はサーバ値で上書きしない
-async function loadMembers(){
-  const agents = await api('/board/agents');
-  const box = document.getElementById('members');
-  const names = Object.keys(agents).sort();
-  document.getElementById('membersNote').textContent = names.length
-    ? 'モデル空欄は CLI の既定。候補は runner 実行時に各 CLI から取得したもの(Claude は固定リスト)'
-    : 'board_agents.py run を1回実行すると登録されます';
-  for (const row of [...box.querySelectorAll('[data-agent]')]){
-    if (!names.includes(row.dataset.agent)) row.remove();
-  }
-  for (const name of names){
-    const a = agents[name];
-    let row = box.querySelector(`[data-agent="${CSS.escape(name)}"]`);
-    if (!row){
-      row = document.createElement('div'); row.dataset.agent = name; row.style.display = 'contents';
-      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.title = '参加する';
-      const lab = document.createElement('span'); lab.className = 'mname';
-      const sel = document.createElement('select');
-      cb.addEventListener('change', () => saveMember(name, {enabled: cb.checked}, cb));
-      sel.addEventListener('change', () => saveMember(name, {model: sel.value}, sel));
-      row.append(cb, lab, sel); box.appendChild(row);
-    }
-    const [cb, lab, sel] = row.children;
-    lab.textContent = name;
-    const sub = document.createElement('span'); sub.className = 'mlabel';
-    sub.textContent = a.label || '';
-    lab.appendChild(sub);
-    if (!cb.disabled) cb.checked = a.enabled !== false;
-    if (!sel.disabled){
-      const current = a.model || '';
-      const options = ['', ...(Array.isArray(a.models) ? a.models : [])];
-      if (current && !options.includes(current)) options.push(current);
-      sel.textContent = '';
-      for (const m of options){
-        const o = document.createElement('option'); o.value = m;
-        o.textContent = m === '' ? ('既定' + (a.default ? ' (' + a.default + ')' : '')) : m;
-        sel.appendChild(o);
-      }
-      sel.value = current;
-    }
-    lab.classList.toggle('off', a.enabled === false);
-    sel.classList.toggle('off', a.enabled === false);
-  }
-}
-
-async function saveMember(name, patch, el){
-  el.disabled = true;
-  try { await api('/board/agents/' + encodeURIComponent(name), patch); }
-  catch (e) { alert(e.message); }
-  el.disabled = false;
-  loadMembers().catch(console.warn);
-}
-
-async function refresh(){
-  try { await loadThreads(); await loadThread(); await loadMembers(); } catch (e) { console.warn(e); }
-}
-
-document.getElementById('postBtn').addEventListener('click', async () => {
-  const btn = document.getElementById('postBtn');
-  const body = document.getElementById('body').value.trim();
-  const author = nameBox.value.trim() || 'human';
-  if (!current || !body) return;
-  btn.disabled = true;
-  try {
-    await api('/board/threads/' + encodeURIComponent(current) + '/posts', {author, body});
-    document.getElementById('body').value = '';
-    try { localStorage.setItem('boardName', author); } catch {}
-    await refresh();
-  } catch (e) { alert(e.message); }
-  btn.disabled = false;
-});
-
-document.getElementById('newBtn').addEventListener('click', async () => {
-  const btn = document.getElementById('newBtn');
-  const title = document.getElementById('newTitle').value.trim();
-  const body = document.getElementById('newBody').value.trim();
-  const author = nameBox.value.trim() || 'human';
-  if (!title) return;
-  btn.disabled = true;
-  try {
-    const payload = {title};
-    if (body){ payload.body = body; payload.author = author; }
-    const t = await api('/board/threads', payload);
-    current = t.id;
-    document.getElementById('newTitle').value = '';
-    document.getElementById('newBody').value = '';
-    await refresh();
-  } catch (e) { alert(e.message); }
-  btn.disabled = false;
-});
-
-refresh(); setInterval(refresh, 15000);
-</script></body></html>"""
+    return render_template("board.html", v=STATIC_VERSION)
 
 
 @app.get("/")
 def index():
-    return """<!doctype html>
-<html lang="ja"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Game Hub</title>
-<!-- deferで読み込み、CDN不通/低速でもカード表示をブロックしない -->
-<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<style>
-  body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;
-       margin:0;padding:1em;max-width:640px;margin-inline:auto}
-  h1{font-size:1.3em;margin:.2em 0 .8em}
-  h2{font-size:1.05em;margin:1.2em 0 .5em;color:#ffd166;text-transform:capitalize}
-  .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:.6em}
-  .card{background:#16213e;border-radius:.6em;padding:.7em .9em}
-  .card .label{font-size:.72em;color:#9aa4c7}
-  .card .value{font-size:1.5em;font-weight:700;margin-top:.15em;
-               font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-  .chartbox{background:#16213e;border-radius:.6em;padding:.7em;margin-top:.6em;height:200px}
-  .chartnote{display:none;color:#9aa4c7;font-size:.8em;padding:.5em}
-  .shot{display:none;width:100%;max-height:70vh;object-fit:contain;
-        background:#16213e;border-radius:.6em;margin-top:.6em}
-  .cfg{display:flex;align-items:center;gap:.5em;background:#16213e;
-       border-radius:.6em;padding:.6em .9em;margin-top:.6em;font-size:.85em}
-  .cfg input{accent-color:#4cc9f0;width:1.1em;height:1.1em}
-  .achievs{background:#16213e;border-radius:.6em;padding:.6em .9em;
-           margin-top:.6em;font-size:.85em}
-  .achievs summary{cursor:pointer;color:#ffd166}
-  .achievs .chips{display:flex;flex-wrap:wrap;gap:.35em;margin-top:.6em}
-  .achievs .chip{background:#26305c;border-radius:.4em;padding:.15em .5em;
-                 font-size:.85em}
-  .achievs .chip.shadow{opacity:.55}
-  .achievs .grouplabel{width:100%;color:#9aa4c7;font-size:.8em;margin-top:.3em}
-  .meta{font-size:.72em;color:#9aa4c7;margin-top:.4em}
-  #empty{color:#9aa4c7}
-</style></head><body>
-<h1>🎮 Game Hub <a href="/board" style="color:#9aa4c7;font-size:.7em;text-decoration:none;margin-left:.8em">💬 AI掲示板</a></h1>
-<div id="games"><p id="empty">loading...</p></div>
-<script>
-const CARDS = [
-  ['cookies','🍪 cookies'], ['cps','⚡ CpS'],
-  ['elderWrath','👵 elderWrath'], ['wrinklers','🐛 wrinklers'],
-  ['lumps','🍬 lumps'], ['prestige','👼 prestige'],
-  ['dragon','🐉 dragon Lv'], ['achievements','🏆 achievements'],
-];
-const WRATH = ['平穏','ざわめき','高まり','黙示録'];
-// game名 -> Chart。'constructor'等のgame名がプロトタイプと衝突しないよう
-// プロトタイプなしオブジェクトを使う
-const charts = Object.create(null);
-
-function fmt(v){
-  if (typeof v !== 'number' || !isFinite(v)) return v ?? '-';
-  if (Math.abs(v) >= 1e15) return v.toExponential(2);
-  return new Intl.NumberFormat('en',{notation:'compact',maximumFractionDigits:1}).format(v);
-}
-
-// gameごとのセクションをDOM APIで組み立てる(game名等をinnerHTMLに混ぜない)
-function section(game){
-  const id = 'sec-' + game;
-  let sec = document.getElementById(id);
-  if (sec) return sec;
-  sec = document.createElement('section');
-  sec.id = id;
-  const h2 = document.createElement('h2');
-  h2.textContent = game;
-  sec.appendChild(h2);
-  const cards = document.createElement('div');
-  cards.className = 'cards';
-  for (const [key,label] of CARDS){
-    const card = document.createElement('div');
-    card.className = 'card';
-    const l = document.createElement('div');
-    l.className = 'label'; l.textContent = label;
-    const v = document.createElement('div');
-    v.className = 'value'; v.dataset.key = key; v.textContent = '-';
-    card.append(l,v); cards.appendChild(card);
-  }
-  sec.appendChild(cards);
-  // 自動昇天トグル。変更はサーバに保存し、クライアントが60秒毎に拾う
-  const cfg = document.createElement('label');
-  cfg.className = 'cfg';
-  const cb = document.createElement('input');
-  cb.type = 'checkbox';
-  cb.addEventListener('change', async () => {
-    cb.disabled = true;
-    try {
-      const res = await fetch('/config/' + encodeURIComponent(game), {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({autoAscend: cb.checked}),
-      });
-      if (res.ok) cb.checked = !!(await res.json()).autoAscend;
-      else cb.checked = !cb.checked;  // 保存失敗時は表示を元に戻す
-    } catch (e) { cb.checked = !cb.checked; console.warn(e); }
-    cb.disabled = false;
-  });
-  const cfgText = document.createElement('span');
-  cfgText.textContent = '⛪ 自動昇天(プレステージ2倍化で実行)';
-  cfg.append(cb, cfgText);
-  sec.appendChild(cfg);
-  const box = document.createElement('div');
-  box.className = 'chartbox';
-  const canvas = document.createElement('canvas');
-  const note = document.createElement('div');
-  note.className = 'chartnote';
-  note.textContent = 'グラフを表示できません(Chart.js 未読込)';
-  box.append(canvas, note); sec.appendChild(box);
-  // 未取得実績の折りたたみリスト(実績ハント用チェックリスト)
-  const ach = document.createElement('details');
-  ach.className = 'achievs';
-  ach.style.display = 'none';
-  const sum = document.createElement('summary');
-  const chips = document.createElement('div');
-  chips.className = 'chips';
-  ach.append(sum, chips);
-  sec.appendChild(ach);
-  const img = document.createElement('img');
-  img.className = 'shot';
-  img.alt = 'screenshot';
-  // 読み込み成功時のみ表示(未送信・配信エラー時に壊れた画像アイコンを出さない)
-  img.addEventListener('load', () => { img.style.display = 'block'; });
-  img.addEventListener('error', () => {
-    img.style.display = 'none';
-    // 一時的な取得失敗を次回refreshで再試行できるよう読込済み判定を破棄
-    delete img.dataset.src;
-  });
-  sec.appendChild(img);
-  const meta = document.createElement('div');
-  meta.className = 'meta'; sec.appendChild(meta);
-  document.getElementById('games').appendChild(sec);
-  return sec;
-}
-
-// Chart.js(defer/CDN)がまだ無ければ作らず、後続のrefreshで再試行する
-function ensureChart(game, sec){
-  if (charts[game]) return charts[game];
-  if (typeof Chart === 'undefined') return null;
-  charts[game] = new Chart(sec.querySelector('canvas'), {
-    type:'line',
-    data:{labels:[],datasets:[{data:[],borderColor:'#4cc9f0',
-      backgroundColor:'rgba(76,201,240,.15)',fill:true,tension:.3,
-      pointRadius:0,borderWidth:2}]},
-    options:{responsive:true,maintainAspectRatio:false,animation:false,
-      plugins:{legend:{display:false},title:{display:true,
-        text:'ベースCpS (today, 対数目盛)',color:'#9aa4c7',font:{size:11}}},
-      scales:{
-        x:{ticks:{color:'#9aa4c7',maxTicksLimit:6},grid:{color:'#26305c'}},
-        // CpSは日内でも桁が跳ね上がり線形軸だと序盤が潰れるため対数軸にする
-        y:{type:'logarithmic',ticks:{color:'#9aa4c7',maxTicksLimit:6,
-          callback:v=>fmt(v)},grid:{color:'#26305c'}}}}
-  });
-  return charts[game];
-}
-
-function updateCards(sec, rec){
-  for (const el of sec.querySelectorAll('.value')){
-    const key = el.dataset.key;
-    let v = rec[key];
-    if (key === 'achievements' && typeof v === 'number' &&
-        typeof rec.achievementsTotal === 'number'){
-      v = fmt(v) + ' / ' + fmt(rec.achievementsTotal);
-    }
-    else if (key === 'elderWrath' && Number.isInteger(v) && WRATH[v]) v = WRATH[v];
-    else v = fmt(v);
-    el.textContent = v;
-  }
-  // トグルはPOST保存中(disabled)でなければサーバ値に同期する。
-  // クリック後もフォーカスは残り続けるため、focus有無は同期の条件にしない
-  const cb = sec.querySelector('.cfg input');
-  if (!cb.disabled){
-    cb.checked = !!(rec.config && rec.config.autoAscend);
-  }
-  const ts = typeof rec.ts === 'number' ? new Date(rec.ts*1000) : null;
-  let meta = ts ? '最終報告: ' + ts.toLocaleTimeString('ja-JP') : '';
-  if (typeof rec.shotTs === 'number'){
-    meta += (meta ? ' / ' : '') + 'スクショ: ' +
-      new Date(rec.shotTs*1000).toLocaleTimeString('ja-JP');
-  }
-  sec.querySelector('.meta').textContent = meta;
-}
-
-// 実績ハント用の未取得リスト。実績名はtextContentで挿入(HTMLに混ぜない)
-function updateAchievements(sec, rec){
-  const box = sec.querySelector('.achievs');
-  const missing = Array.isArray(rec.missingAchievements)
-    ? rec.missingAchievements : null;
-  if (!missing){ box.style.display = 'none'; return; } // 旧クライアント
-  box.style.display = 'block';
-  const shadowMissing = Array.isArray(rec.missingShadow) ? rec.missingShadow : [];
-  let label = '🏆 未取得の実績 ' + missing.length + '件';
-  if (typeof rec.shadowOwned === 'number' && typeof rec.shadowTotal === 'number'){
-    label += '(シャドウ ' + rec.shadowOwned + '/' + rec.shadowTotal + ')';
-  }
-  sec.querySelector('.achievs summary').textContent = label;
-  // 内容が変わったときだけチップ群を組み直す(30秒ごとの全再構築を避ける)
-  const chips = sec.querySelector('.achievs .chips');
-  const sig = JSON.stringify([missing, shadowMissing]);
-  if (chips.dataset.sig === sig) return;
-  chips.dataset.sig = sig;
-  chips.textContent = '';
-  for (const name of missing){
-    const c = document.createElement('span');
-    c.className = 'chip'; c.textContent = name;
-    chips.appendChild(c);
-  }
-  if (shadowMissing.length){
-    const gl = document.createElement('div');
-    gl.className = 'grouplabel';
-    gl.textContent = 'シャドウ実績(milk対象外・任意)';
-    chips.appendChild(gl);
-    for (const name of shadowMissing){
-      const c = document.createElement('span');
-      c.className = 'chip shadow'; c.textContent = name;
-      chips.appendChild(c);
-    }
-  }
-}
-
-function updateShot(sec, game, rec){
-  const img = sec.querySelector('.shot');
-  if (typeof rec.shotTs !== 'number'){
-    img.style.display = 'none';
-    img.removeAttribute('src');
-    delete img.dataset.src;
-    return;
-  }
-  // shotTsをキャッシュバスタに使い、画像が更新された時だけ再取得する
-  const src = '/shot/' + encodeURIComponent(game) + '?t=' + rec.shotTs;
-  if (img.dataset.src !== src){ img.dataset.src = src; img.src = src; }
-}
-
-async function updateChart(game, sec){
-  const c = ensureChart(game, sec);
-  sec.querySelector('.chartnote').style.display = c ? 'none' : 'block';
-  if (!c) return;
-  const res = await fetch('/history/' + encodeURIComponent(game));
-  if (!res.ok) return;
-  // Frenzy等のバフによるスパイクで暴れないよう、バフ抜きのbaseCpsを描く。
-  // baseCps未対応の旧クライアントのreportはcpsで代用。
-  // 対数軸は0以下を描画できないため除外する
-  const points = (await res.json())
-    .map(p => ({ts: p.ts, v: typeof p.baseCps === 'number' ? p.baseCps : p.cps}))
-    .filter(p => typeof p.v === 'number' && p.v > 0);
-  c.data.labels = points.map(p => new Date(p.ts*1000)
-    .toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'}));
-  c.data.datasets[0].data = points.map(p => p.v);
-  c.update();
-}
-
-// game 0件時の空表示(初回のloading...置き換え/全ゲーム消滅時の復元)
-function updateEmptyState(count){
-  let empty = document.getElementById('empty');
-  if (count){ if (empty) empty.remove(); return; }
-  if (!empty){
-    empty = document.createElement('p');
-    empty.id = 'empty';
-    document.getElementById('games').appendChild(empty);
-  }
-  empty.textContent = 'まだ報告がありません';
-}
-
-async function refresh(){
-  let st;
-  try { st = await (await fetch('/status')).json(); } catch { return; }
-  const games = Object.keys(st);
-  updateEmptyState(games.length);
-  // /statusから消えたゲームのセクションを古い値のまま残さない
-  for (const sec of document.querySelectorAll('section[id^="sec-"]')){
-    const g = sec.id.slice(4);
-    if (!games.includes(g)){
-      sec.remove();
-      if (charts[g]){ charts[g].destroy(); delete charts[g]; }
-    }
-  }
-  for (const game of games){
-    // 1ゲームの失敗(グラフ生成エラー等)で他ゲームの描画を止めない
-    try {
-      const sec = section(game);
-      updateCards(sec, st[game]);
-      updateAchievements(sec, st[game]);
-      updateShot(sec, game, st[game]);
-      await updateChart(game, sec);
-    } catch (e) { console.warn(e); }
-  }
-}
-refresh(); setInterval(refresh, 30000);
-// defer読み込みのChart.jsが初回refresh後に間に合った場合の再描画
-window.addEventListener('load', refresh);
-</script></body></html>"""
+    return render_template("index.html", v=STATIC_VERSION)
 
 
 if __name__ == "__main__":

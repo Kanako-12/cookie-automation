@@ -380,14 +380,20 @@ def agent_enabled(agent, prefs):
     return not (isinstance(pref, dict) and pref.get("enabled") is False)
 
 
-def pick_thread(cfg, override):
+def pick_threads(cfg, override):
+    """返信対象のスレッド ID 一覧。--thread / 設定の thread が最優先。
+    無ければ Hub で「AI の対象」になっているスレッド全部、それも無ければ最新の1件"""
     tid = override or cfg.get("thread")
     if tid:
-        return tid
+        return [tid]
+    active = hub_request(cfg["hub"], "/board/threads?active=1")
+    ids = [t["id"] for t in active if isinstance(t, dict) and isinstance(t.get("id"), str)]
+    if ids:
+        return ids
     threads = hub_request(cfg["hub"], "/board/threads")
     if not threads:
         sys.exit("no threads on the board yet (create one at /board)")
-    return threads[0]["id"]  # 最新のスレッド
+    return [threads[0]["id"]]  # 最新のスレッド
 
 
 def state_path(cfg):
@@ -588,34 +594,42 @@ def run(args):
     lock = acquire_lock(cfg) if not args.dry_run else None  # noqa: F841 - 保持が目的
     prefs = {}
     try:
-        tid = pick_thread(cfg, args.thread)
+        tids = pick_threads(cfg, args.thread)
         if not args.dry_run and not args.no_sync:
             sync_models(cfg)
         prefs = load_prefs(cfg)
         if args.agent:
-            order = [a for a in agents if a["name"] == args.agent]  # 手動指定は参加オフでも起動する
-            if not order:
+            if not any(a["name"] == args.agent for a in agents):
                 sys.exit(f"unknown agent: {args.agent}")
         else:
-            start = agents.index(next_agent(agents, cfg, tid))
-            order = [a for a in agents[start:] + agents[:start] if agent_enabled(a, prefs)]
             for a in agents:
                 if not agent_enabled(a, prefs):
                     print(f"[board] {a['name']}: disabled in member settings, skipping", flush=True)
-            if not order:
+            if not any(agent_enabled(a, prefs) for a in agents):
                 sys.exit("no enabled agents (enable someone in the member settings on /board)")
     except RuntimeError as e:
         if not args.dry_run:
             sys.exit(str(e))
         # dry-runはHub未起動でもコマンドの確認だけはできるようにする
         print(f"[board] {e} (dry-run: continuing with config order)", flush=True)
-        tid, order = args.thread or cfg.get("thread") or "THREAD_ID", agents
+        tids = [args.thread or cfg.get("thread") or "THREAD_ID"]
+
+    def order_for(tid):
+        if args.agent:
+            return [a for a in agents if a["name"] == args.agent]  # 手動指定は参加オフでも起動する
+        start = agents.index(next_agent(agents, cfg, tid))
+        order = [a for a in agents[start:] + agents[:start] if agent_enabled(a, prefs)]
+        return order[:1] if args.one else order  # --one: 順番の次の1人だけ(ダッシュボードの「今すぐ返事」)
+
     failures = 0
     try:
-        for _ in range(args.rounds):
-            for agent in order:
-                if not run_agent(cfg, agent, tid, args.dry_run, prefs):
-                    failures += 1
+        for tid in tids:
+            if len(tids) > 1:
+                print(f"[board] thread {tid}", flush=True)
+            for _ in range(args.rounds):
+                for agent in order_for(tid):
+                    if not run_agent(cfg, agent, tid, args.dry_run, prefs):
+                        failures += 1
     except RuntimeError as e:
         sys.exit(str(e))
     sys.exit(1 if failures else 0)
@@ -636,6 +650,7 @@ def main():
     r.add_argument("--thread", help="対象スレッドID(省略時は設定値、無ければ最新スレッド)")
     r.add_argument("--agent", help="このAIだけ起動する")
     r.add_argument("--rounds", type=int, default=1, help="全員を何周させるか")
+    r.add_argument("--one", action="store_true", help="順番の次の1人だけ返信させる")
     r.add_argument("--dry-run", action="store_true", help="コマンドを表示するだけで起動しない")
     r.add_argument("--no-sync", action="store_true", help="モデル候補の Hub への登録を省略する")
     r.set_defaults(func=run)
