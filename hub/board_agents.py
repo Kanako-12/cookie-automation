@@ -204,9 +204,10 @@ def load_config(path):
         cmd = a.get("command")
         if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
             sys.exit(f"config: agent {a['name']}: command must be a non-empty list of strings")
-        # label は任意。null や非文字列なら name で代用する
-        if not isinstance(a.get("label"), str) or not a["label"]:
+        # label は任意。null や非文字列なら name で代用し、hub の上限(80文字)に切り詰める
+        if not isinstance(a.get("label"), str) or not a["label"].strip():
             a["label"] = a["name"]
+        a["label"] = a["label"].strip()[:POST_MODEL_MAX]
         # model_args: モデル指定時にコマンドの {model_args} に展開する引数(例 ["-m", "{model}"])
         margs = a.get("model_args")
         if margs is not None and (not isinstance(margs, list) or not margs
@@ -247,8 +248,8 @@ def models_codex(agent, spec):
     items = data if isinstance(data, list) else data.get("models", [])
     items = [m for m in items if isinstance(m, dict) and isinstance(m.get("slug"), str)]
     items.sort(key=lambda m: m.get("priority", 10**6) if isinstance(m.get("priority"), int) else 10**6)
-    # レビュー専用モデル等の会話用でない slug は除く
-    return [m["slug"] for m in items if "review" not in m["slug"]]
+    # レビュー専用モデル(codex-auto-review 等)は除く。"preview" を巻き込まないよう区切り単位で判定する
+    return [m["slug"] for m in items if "review" not in re.split(r"[-_.]", m["slug"])]
 
 
 def gemini_api_key():
