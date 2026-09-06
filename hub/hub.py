@@ -1,5 +1,5 @@
-from flask import Flask, abort, jsonify, render_template, request
-import base64, collections, json, math, os, pathlib, re, secrets, subprocess, sys, tempfile, threading, time
+from flask import Flask, abort, jsonify, render_template, request, send_file
+import base64, collections, io, json, math, os, pathlib, re, secrets, shutil, subprocess, sys, tempfile, threading, time
 
 app = Flask(__name__)
 HERE = pathlib.Path(__file__).resolve().parent
@@ -20,8 +20,8 @@ HISTORY_EXCLUDE = ("missingAchievements", "missingShadow")
 # autoAscend: クライアントの自動昇天(既定オフ。ダッシュボードのトグルで切替)
 CONFIG_DEFAULTS = {"autoAscend": False}
 
-# shot便(base64画像)が最大。デコード後上限+base64膨張分(4/3)より広めに取る
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+# 掲示板の添付(1投稿あたり最大 ATTACH_PER_POST × ATTACH_MAX_BYTES)と shot便(base64画像)を収める上限
+app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
 
 SHOT_DATAURL = re.compile(r"data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)")
 SHOT_MAX_BYTES = 4 * 1024 * 1024
@@ -257,6 +257,16 @@ BOARD_BODY_MAX = 8000
 BOARD_POSTS_MAX = 2000  # 1スレッドあたりの投稿上限(ファイル肥大とプロンプト膨張の防止)
 # メンバー(参加AI)の設定。runner が候補モデル一覧を報告し、ダッシュボードで参加/モデルを選ぶ
 AGENTS_FILE = "agents.json"
+# 添付ファイル: ~/gamehub/board/files/<thread>/<fileid> に本体、<fileid>.json にメタ(名前・MIME・サイズ)
+FILES_DIR = "files"
+FILE_ID = re.compile(r"[0-9a-f]{16}")
+ATTACH_MAX_BYTES = 10 * 1024 * 1024
+ATTACH_PER_POST = 5
+ATTACH_NAME_MAX = 120
+# ブラウザにそのまま表示してよい MIME(画像はマジックバイトで判定)。それ以外はダウンロードにする
+IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"),
+               (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"), (b"RIFF", "image/webp"))
+TEXT_EXT = {".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".ts", ".html", ".css", ".yaml", ".yml", ".toml", ".sh"}
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
 AGENT_MODELS_MAX = 100
 # 「今すぐ返事」: ダッシュボードから runner(board_agents.py)を起動する。
@@ -318,20 +328,86 @@ def text_field(payload, key, limit, required=True):
     return value
 
 
-def make_post(payload, n):
+def make_post(payload, n, files=None):
     author = text_field(payload, "author", 32)
     if not AUTHOR.fullmatch(author):
         abort(400, description="author must match [A-Za-z0-9_.-]")
+    body = text_field(payload, "body", BOARD_BODY_MAX, required=not files)
     post = {
         "n": n,
         "ts": time.time(),
         "author": author,
-        "body": text_field(payload, "body", BOARD_BODY_MAX),
+        "body": body or "",
     }
     model = text_field(payload, "model", BOARD_MODEL_MAX, required=False)
     if model:
         post["model"] = model
+    if files:
+        post["files"] = files
     return post
+
+
+def files_dir(tid):
+    return BOARD / FILES_DIR / tid
+
+
+def sniff_image(raw):
+    for magic, mime in IMAGE_MAGIC:
+        if raw.startswith(magic):
+            if mime == "image/webp" and raw[8:12] != b"WEBP":
+                continue
+            return mime
+    return None
+
+
+def attachment_mime(name, raw, declared):
+    """配信時に使う MIME。画像は実データで判定し、テキスト系は拡張子で決める。それ以外はダウンロード扱い"""
+    image = sniff_image(raw)
+    if image:
+        return image
+    ext = pathlib.PurePosixPath(name).suffix.lower()
+    if ext in TEXT_EXT or (isinstance(declared, str) and declared.startswith("text/")):
+        return "text/plain"
+    if ext == ".pdf" and raw.startswith(b"%PDF"):
+        return "application/pdf"
+    return "application/octet-stream"
+
+
+def save_attachments(tid, uploads):
+    """multipart の添付を保存してメタ情報のリストを返す(投稿 JSON に埋める)"""
+    uploads = [u for u in uploads if u and u.filename]
+    if not uploads:
+        return []
+    if len(uploads) > ATTACH_PER_POST:
+        abort(400, description=f"too many files (max {ATTACH_PER_POST})")
+    d = files_dir(tid)
+    d.mkdir(parents=True, exist_ok=True)
+    metas = []
+    for u in uploads:
+        raw = u.stream.read(ATTACH_MAX_BYTES + 1)
+        if len(raw) > ATTACH_MAX_BYTES:
+            abort(413, description=f"file too large (max {ATTACH_MAX_BYTES // 1024 // 1024}MB)")
+        if not raw:
+            abort(400, description="empty file")
+        # 元のファイル名はパス部分を落として表示用にだけ使う。保存名は乱数 ID
+        name = pathlib.PurePosixPath(u.filename.replace("\\", "/")).name.strip() or "file"
+        name = re.sub(r"[\x00-\x1f]", "", name)[:ATTACH_NAME_MAX]
+        fid = secrets.token_hex(8)
+        meta = {"id": fid, "name": name, "size": len(raw), "mime": attachment_mime(name, raw, u.mimetype)}
+        write_atomic(d / fid, raw)
+        write_atomic(d / f"{fid}.json", json.dumps(meta, ensure_ascii=False))
+        metas.append(meta)
+    return metas
+
+
+def read_attachment(tid, fid):
+    if not THREAD_ID.fullmatch(tid) or not FILE_ID.fullmatch(fid):
+        abort(404)
+    d = files_dir(tid)
+    meta = read_json(d / f"{fid}.json")
+    if meta is None or not (d / fid).is_file():
+        abort(404)
+    return d / fid, meta
 
 
 def list_threads():
@@ -418,6 +494,7 @@ def board_thread_delete(tid):
         if not path.is_file():
             abort(404)
         path.unlink()
+        shutil.rmtree(files_dir(tid), ignore_errors=True)
     return jsonify(ok=True)
 
 
@@ -480,7 +557,14 @@ def board_job_start():
 
 @app.post("/board/threads/<tid>/posts")
 def board_post(tid):
-    payload = request.get_json(silent=True)
+    """JSON(author/body/model)か、添付付きの multipart(author/body + files[])"""
+    thread_path(tid)  # ID の検証
+    if request.content_type and request.content_type.startswith("multipart/form-data"):
+        payload = {k: request.form.get(k) for k in ("author", "body", "model") if request.form.get(k) is not None}
+        uploads = request.files.getlist("files")
+    else:
+        payload = request.get_json(silent=True)
+        uploads = []
     if not isinstance(payload, dict):
         abort(400, description="JSON object required")
     with BOARD_LOCK:
@@ -490,10 +574,20 @@ def board_post(tid):
         # 通し番号は末尾+1(欠番があっても単調増加にする)
         last_n = record["posts"][-1].get("n") if record["posts"] else 0
         n = (last_n if isinstance(last_n, int) else len(record["posts"])) + 1
-        post = make_post(payload, n)
+        files = save_attachments(tid, uploads)
+        post = make_post(payload, n, files)
         record["posts"].append(post)
         write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
     return jsonify(post), 201
+
+
+@app.get("/board/files/<tid>/<fid>")
+def board_file(tid, fid):
+    path, meta = read_attachment(tid, fid)
+    mime = meta.get("mime") if isinstance(meta.get("mime"), str) else "application/octet-stream"
+    inline = mime.startswith("image/") or mime in ("text/plain", "application/pdf")
+    name = meta.get("name") if isinstance(meta.get("name"), str) else fid
+    return send_file(path, mimetype=mime, as_attachment=not inline, download_name=name, max_age=86400)
 
 
 def read_agents():

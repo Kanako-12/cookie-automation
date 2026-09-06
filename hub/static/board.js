@@ -1,5 +1,7 @@
-// AI掲示板: スレッド一覧/本文/メンバー設定/今すぐ返事。全て JSON API 経由で、HTML には textContent で挿入する
+// AI掲示板(Discord 風): 左ドロワーにスレッドとメンバー、中央にメッセージ、下部固定の入力欄。
+// 全て JSON API 経由で、HTML には textContent で挿入する(innerHTML 不使用)
 const PALETTE = ['#1a73e8','#d93025','#f9ab00','#188038','#a142f4','#e8710a'];
+const GROUP_WINDOW = 5 * 60;  // 同じ人の連投をまとめる間隔(秒)
 function color(name){
   let h = 0; for (const ch of String(name)) h = (h*31 + ch.charCodeAt(0)) >>> 0;
   return PALETTE[h % PALETTE.length];
@@ -17,6 +19,7 @@ function fmtTime(ts){
   return sameDay ? d.toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'})
                  : d.toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
 }
+function fmtSize(n){ return n >= 1048576 ? (n/1048576).toFixed(1) + 'MB' : Math.max(1, Math.round(n/1024)) + 'KB'; }
 let toastTimer = null;
 function toast(msg){
   let t = document.querySelector('.toast');
@@ -25,8 +28,10 @@ function toast(msg){
   toastTimer = setTimeout(() => t.remove(), 4000);
 }
 async function api(path, body, method){
-  const init = body === undefined && !method ? {} :
-    {method: method || 'POST', headers: {'Content-Type': 'application/json'}, body: body === undefined ? undefined : JSON.stringify(body)};
+  let init = {};
+  if (body instanceof FormData) init = {method: method || 'POST', body};
+  else if (body !== undefined || method) init = {method: method || 'POST', headers: {'Content-Type': 'application/json'},
+                                                 body: body === undefined ? undefined : JSON.stringify(body)};
   const res = await fetch(path, init);
   if (!res.ok){
     const text = (await res.text()).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -40,19 +45,28 @@ let current = (location.hash.match(/^#t=([A-Za-z0-9_-]{1,64})$/) || [])[1] || nu
 let threads = [];
 let agents = {};
 let jobTimer = null;
-let loadSeq = 0;  // loadThread の世代番号。最後に開始した取得だけを描画する
+let loadSeq = 0;      // loadThread の世代番号。最後に開始した取得だけを描画する
+let lastPostKey = ''; // 描画済みの最後の投稿(変化があったときだけ再描画して末尾へスクロール)
+let pending = [];     // 添付待ちのファイル
 const $ = id => document.getElementById(id);
 const nameBox = $('name');
 try { nameBox.value = localStorage.getItem('boardName') || 'human'; } catch { nameBox.value = 'human'; }
 try { $('showArchived').checked = localStorage.getItem('boardShowArchived') === '1'; } catch {}
+
+// ---- drawer (mobile) ----
+function setDrawer(open){
+  $('drawer').classList.toggle('open', open);
+  $('scrim').classList.toggle('open', open);
+}
+$('drawerBtn').addEventListener('click', () => setDrawer(!$('drawer').classList.contains('open')));
+$('scrim').addEventListener('click', () => setDrawer(false));
 
 // ---- threads ----
 async function loadThreads(){
   const all = $('showArchived').checked;
   threads = await api('/board/threads' + (all ? '?all=1' : ''));
   $('threadCount').textContent = threads.length ? threads.length + '件' : '';
-  const list = $('threads'), chips = $('threadChips');
-  list.textContent = ''; chips.textContent = '';
+  const list = $('threads'); list.textContent = '';
   if (!threads.length) list.appendChild(el('div', 'empty small', 'スレッドはまだありません'));
   for (const t of threads){
     const b = el('button', 'thread-item' + (t.id === current ? ' active' : ''));
@@ -61,27 +75,46 @@ async function loadThreads(){
     if (t.active) { const d = el('span', 'dot'); d.title = 'AIの返信対象'; m.appendChild(d); }
     m.appendChild(el('span', '', t.posts + '件' + (t.lastTs ? ' · ' + fmtTime(t.lastTs) : '') + (t.archived ? ' · アーカイブ' : '')));
     b.appendChild(m);
-    b.addEventListener('click', () => selectThread(t.id));
+    b.addEventListener('click', () => { selectThread(t.id); setDrawer(false); });
     list.appendChild(b);
-    const c = el('button', 'chip' + (t.id === current ? ' active' : ''), (t.active ? '● ' : '') + t.title);
-    c.addEventListener('click', () => selectThread(t.id));
-    chips.appendChild(c);
   }
   if ((!current || !threads.some(t => t.id === current)) && threads.length) current = threads[0].id;
   if (!threads.length) current = null;
 }
-
 function selectThread(id){
+  if (id !== current) lastPostKey = '';
   current = id;
   history.replaceState(null, '', '#t=' + id);
   refresh();
 }
 
+// ---- messages ----
+function renderAttachments(p){
+  const files = Array.isArray(p.files) ? p.files : [];
+  if (!files.length) return null;
+  const box = el('div', 'att');
+  for (const f of files){
+    if (!f || typeof f.id !== 'string') continue;
+    const url = '/board/files/' + encodeURIComponent(current) + '/' + encodeURIComponent(f.id);
+    if (typeof f.mime === 'string' && f.mime.startsWith('image/')){
+      const a = el('a'); a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      const img = el('img', 'att-img'); img.src = url; img.alt = f.name || ''; img.loading = 'lazy';
+      a.appendChild(img); box.appendChild(a);
+    } else {
+      const a = el('a', 'att-file'); a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      a.append(el('span', '', '📄'), el('span', 'n', f.name || f.id), el('span', 's', fmtSize(f.size || 0)));
+      box.appendChild(a);
+    }
+  }
+  return box;
+}
+function nearBottom(box){ return box.scrollHeight - box.scrollTop - box.clientHeight < 80; }
+
 async function loadThread(){
-  const card = $('threadCard');
   if (!current){
     $('title').textContent = ''; $('title').appendChild(el('span', 'muted', 'スレッドを選んでください'));
-    $('toolbar').hidden = true; $('composer').hidden = true; $('posts').textContent = '';
+    $('toolbar').hidden = true; $('menu').hidden = true; $('composer').hidden = true;
+    $('posts').textContent = ''; $('posts').appendChild(el('p', 'empty', 'スレッドを選んでください'));
     return;
   }
   const tid = current, seq = ++loadSeq;
@@ -89,24 +122,36 @@ async function loadThread(){
   // 取得中に別スレッドへ切り替えた、または同じスレッドをより新しく取得し直した場合は古い応答を描画しない
   if (current !== tid || seq !== loadSeq) return;
   $('title').textContent = t.title;
-  $('toolbar').hidden = false; $('composer').hidden = false;
+  $('toolbar').hidden = false; $('menu').hidden = false; $('composer').hidden = false;
   const active = $('activeToggle');
   if (!active.disabled) active.checked = t.active === true;
   $('archiveBtn').textContent = t.archived ? 'アーカイブから戻す' : 'アーカイブ';
-  const box = $('posts'); box.textContent = '';
-  if (!t.posts.length) box.appendChild(el('p', 'empty', 'まだ投稿がありません'));
+  const box = $('posts');
+  const last = t.posts[t.posts.length - 1];
+  const key = tid + ':' + t.posts.length + ':' + (last ? last.n + ':' + last.ts : '');
+  if (key === lastPostKey) return;  // 変化なし。スクロール位置を保つ
+  const stick = lastPostKey === '' || nearBottom(box);
+  lastPostKey = key;
+  box.textContent = '';
+  if (!t.posts.length) box.appendChild(el('p', 'empty', 'まだ投稿がありません。最初のメッセージをどうぞ'));
+  let prev = null;
   for (const p of t.posts){
-    const post = el('article', 'post');
+    const cont = prev && prev.author === p.author && typeof p.ts === 'number' && typeof prev.ts === 'number'
+                 && p.ts - prev.ts < GROUP_WINDOW && (prev.model || '') === (p.model || '');
+    const msg = el('article', 'msg' + (cont ? ' cont' : ''));
     const av = el('div', 'avatar', String(p.author || '?').slice(0, 1).toUpperCase());
     av.style.background = color(p.author);
     const body = el('div');
-    const head = el('div', 'post-head');
+    const head = el('div', 'msg-head');
     head.appendChild(el('span', 'name', p.author));
     if (p.model) head.appendChild(el('span', 'model', p.model));
-    head.appendChild(el('span', 'time', '#' + p.n + ' · ' + fmtTime(p.ts)));
-    body.append(head, el('div', 'post-body', p.body));
-    post.append(av, body); box.appendChild(post);
+    head.appendChild(el('span', 'time', fmtTime(p.ts)));
+    body.append(head, el('div', 'msg-body', p.body || ''));
+    const att = renderAttachments(p); if (att) body.appendChild(att);
+    msg.append(av, body); box.appendChild(msg);
+    prev = p;
   }
+  if (stick) box.scrollTop = box.scrollHeight;
 }
 
 // ---- members ----
@@ -215,21 +260,20 @@ $('activeToggle').addEventListener('change', async () => {
   }
   catch (e) { toast(e.message); if (current === tid) cb.checked = !wanted; }
   cb.disabled = false;
-  // 切り替え中に他のスレッドへ移っていた場合は、そのスレッドの状態を取り直す
   if (current !== tid) loadThread().catch(console.warn);
   loadThreads().catch(console.warn);
 });
 $('archiveBtn').addEventListener('click', async () => {
   document.querySelector('details.menu').open = false;
   const t = threads.find(x => x.id === current);
-  try { await api('/board/threads/' + encodeURIComponent(current), {archived: !(t && t.archived)}); await refresh(); }
+  try { await api('/board/threads/' + encodeURIComponent(current), {archived: !(t && t.archived)}); lastPostKey = ''; await refresh(); }
   catch (e) { toast(e.message); }
 });
 $('deleteBtn').addEventListener('click', async () => {
   document.querySelector('details.menu').open = false;
   const t = threads.find(x => x.id === current);
-  if (!confirm('スレッド「' + (t ? t.title : current) + '」を削除します。元に戻せません。よろしいですか?')) return;
-  try { await api('/board/threads/' + encodeURIComponent(current), undefined, 'DELETE'); current = null; history.replaceState(null, '', ' '); await refresh(); }
+  if (!confirm('スレッド「' + (t ? t.title : current) + '」を削除します。添付ファイルも消え、元に戻せません。よろしいですか?')) return;
+  try { await api('/board/threads/' + encodeURIComponent(current), undefined, 'DELETE'); current = null; lastPostKey = ''; history.replaceState(null, '', ' '); await refresh(); }
   catch (e) { toast(e.message); }
 });
 $('showArchived').addEventListener('change', () => {
@@ -242,18 +286,53 @@ document.addEventListener('click', e => {
 });
 
 // ---- compose ----
-$('postBtn').addEventListener('click', async () => {
-  const btn = $('postBtn'), body = $('body').value.trim(), author = nameBox.value.trim() || 'human';
-  if (!current || !body) return;
+const bodyBox = $('body');
+function autoGrow(){ bodyBox.style.height = 'auto'; bodyBox.style.height = Math.min(bodyBox.scrollHeight, 160) + 'px'; }
+bodyBox.addEventListener('input', autoGrow);
+// Enter で送信(Shift+Enter で改行)。日本語入力の変換確定 Enter は isComposing で除外。タッチ端末は改行のまま
+const touch = matchMedia('(pointer: coarse)').matches;
+bodyBox.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && (!touch || e.ctrlKey || e.metaKey)){ e.preventDefault(); sendPost(); }
+  else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)){ e.preventDefault(); sendPost(); }
+});
+function renderPending(){
+  const box = $('attachList'); box.textContent = '';
+  pending.forEach((f, i) => {
+    const c = el('span', 'chip', (f.type.startsWith('image/') ? '🖼 ' : '📄 ') + f.name + ' (' + fmtSize(f.size) + ')');
+    const x = el('button', '', '✕'); x.title = '外す'; x.addEventListener('click', () => { pending.splice(i, 1); renderPending(); });
+    c.appendChild(x); box.appendChild(c);
+  });
+}
+$('attachBtn').addEventListener('click', () => $('fileInput').click());
+$('fileInput').addEventListener('change', () => {
+  for (const f of $('fileInput').files){
+    if (pending.length >= 5){ toast('添付は5件までです'); break; }
+    if (f.size > 10 * 1048576){ toast(f.name + ' は10MBを超えています'); continue; }
+    pending.push(f);
+  }
+  $('fileInput').value = ''; renderPending();
+});
+async function sendPost(){
+  const btn = $('postBtn'), body = bodyBox.value.trim(), author = nameBox.value.trim() || 'human';
+  if (!current || (!body && !pending.length)) return;
   btn.disabled = true;
   try {
-    await api('/board/threads/' + encodeURIComponent(current) + '/posts', {author, body});
-    $('body').value = '';
+    if (pending.length){
+      const fd = new FormData(); fd.append('author', author); fd.append('body', body);
+      for (const f of pending) fd.append('files', f, f.name);
+      await api('/board/threads/' + encodeURIComponent(current) + '/posts', fd);
+    } else {
+      await api('/board/threads/' + encodeURIComponent(current) + '/posts', {author, body});
+    }
+    bodyBox.value = ''; autoGrow(); pending = []; renderPending();
     try { localStorage.setItem('boardName', author); } catch {}
+    lastPostKey = '';  // 自分の投稿は必ず末尾へスクロール
     await refresh();
+    bodyBox.focus();
   } catch (e) { toast(e.message); }
   btn.disabled = false;
-});
+}
+$('postBtn').addEventListener('click', sendPost);
 $('newBtn').addEventListener('click', async () => {
   const btn = $('newBtn'), title = $('newTitle').value.trim(), body = $('newBody').value.trim(), author = nameBox.value.trim() || 'human';
   if (!title) { $('newTitle').focus(); return; }
@@ -261,8 +340,8 @@ $('newBtn').addEventListener('click', async () => {
   try {
     const payload = {title}; if (body){ payload.body = body; payload.author = author; }
     const t = await api('/board/threads', payload);
-    $('newTitle').value = ''; $('newBody').value = '';
-    selectThread(t.id);
+    $('newTitle').value = ''; $('newBody').value = ''; document.querySelector('.newthread').open = false;
+    setDrawer(false); selectThread(t.id);
   } catch (e) { toast(e.message); }
   btn.disabled = false;
 });
