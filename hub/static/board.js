@@ -200,14 +200,20 @@ $('replyBtn').addEventListener('click', async () => {
 // ---- thread actions ----
 $('activeToggle').addEventListener('change', async () => {
   const cb = $('activeToggle'); cb.disabled = true;
+  const tid = current, wanted = cb.checked;  // 応答が返る前に別スレッドへ切り替えた場合に備えて保持
   try {
     // サーバは archived のスレッドでは active を false に戻すので、表示は応答の値に合わせる
-    const t = await api('/board/threads/' + encodeURIComponent(current), {active: cb.checked});
-    cb.checked = t.active === true;
-    if (cb.checked !== (t.archived !== true) && t.archived) toast('アーカイブ済みのスレッドはAIの対象にできません');
+    const t = await api('/board/threads/' + encodeURIComponent(tid), {active: wanted});
+    if (current === tid){
+      cb.checked = t.active === true;
+      if (wanted && t.archived) toast('アーカイブ済みのスレッドはAIの対象にできません');
+    }
   }
-  catch (e) { toast(e.message); cb.checked = !cb.checked; }
-  cb.disabled = false; loadThreads().catch(console.warn);
+  catch (e) { toast(e.message); if (current === tid) cb.checked = !wanted; }
+  cb.disabled = false;
+  // 切り替え中に他のスレッドへ移っていた場合は、そのスレッドの状態を取り直す
+  if (current !== tid) loadThread().catch(console.warn);
+  loadThreads().catch(console.warn);
 });
 $('archiveBtn').addEventListener('click', async () => {
   document.querySelector('details.menu').open = false;
