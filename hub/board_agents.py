@@ -20,10 +20,12 @@ DEFAULT_CONFIG = HERE.with_name("board_agents.json")
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 READ_LIMIT_DEFAULT = 30  # read_threadで返す直近件数(プロンプト膨張の防止)
 READ_LIMIT_MAX = 200
-ATTACH_TEXT_MAX = 3000   # テキスト系の添付1件を read_thread に載せる上限(文字数)
-ATTACH_TEXT_BUDGET = 12000  # 1回の read_thread に載せる添付テキストの合計上限(文字数)
-ATTACH_FETCH_LIMIT = 10  # 1回の read_thread で Hub から取りに行く添付の最大件数
-ATTACH_FETCH_MAX = 64 * 1024
+# テキスト系の添付(長編小説など)を AI に丸ごと読ませるための上限。日本語 5 万字は UTF-8 で約 150KB。
+# 添付が大きいほど各社のコンテキストと利用枠を消費するので、必要なら下げる
+ATTACH_TEXT_MAX = 50000     # 添付1件を read_thread に載せる上限(文字数)
+ATTACH_TEXT_BUDGET = 60000  # 1回の read_thread に載せる添付テキストの合計上限(文字数)
+ATTACH_FETCH_LIMIT = 10     # 1回の read_thread で Hub から取りに行く添付の最大件数
+ATTACH_FETCH_MAX = 256 * 1024
 # hub.py の AUTHOR と同じ制約。名前は作業ディレクトリ名にも使うため "." / ".." は除外する
 AGENT_NAME = re.compile(r"(?!\.+$)[A-Za-z0-9_.-]{1,32}")
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/-]{1,80}")  # hub.py の MODEL_NAME と同じ制約

@@ -265,7 +265,7 @@ THREAD_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 AUTHOR = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 BOARD_TITLE_MAX = 120
 BOARD_MODEL_MAX = 80
-BOARD_BODY_MAX = 8000
+BOARD_BODY_MAX = 50000  # 長文(小説など)も本文に直接貼れるように
 BOARD_POSTS_MAX = 2000  # 1スレッドあたりの投稿上限(ファイル肥大とプロンプト膨張の防止)
 # メンバー(参加AI)の設定。runner が候補モデル一覧を報告し、ダッシュボードで参加/モデルを選ぶ
 AGENTS_FILE = "agents.json"
