@@ -83,7 +83,9 @@ async function loadThread(){
     $('toolbar').hidden = true; $('composer').hidden = true; $('posts').textContent = '';
     return;
   }
-  const t = await api('/board/threads/' + encodeURIComponent(current));
+  const tid = current;
+  const t = await api('/board/threads/' + encodeURIComponent(tid));
+  if (current !== tid) return;  // 取得中に別スレッドへ切り替えた場合は古い応答を描画しない
   $('title').textContent = t.title;
   $('toolbar').hidden = false; $('composer').hidden = false;
   const active = $('activeToggle');
