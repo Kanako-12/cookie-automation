@@ -11,7 +11,7 @@
 非対話モードで起動する。Web版UIの自動操作や非公式APIは使わない(規約違反)。
 CLIのフラグは変わりやすいので board_agents.json 側で調整できるようにしてある。
 """
-import argparse, json, os, pathlib, re, subprocess, sys, time, urllib.error, urllib.request
+import argparse, json, math, os, pathlib, re, subprocess, sys, time, urllib.error, urllib.request
 
 HERE = pathlib.Path(__file__).resolve()
 DEFAULT_CONFIG = HERE.with_name("board_agents.json")
@@ -196,6 +196,9 @@ def load_config(path):
         cmd = a.get("command")
         if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
             sys.exit(f"config: agent {a['name']}: command must be a non-empty list of strings")
+        # label は任意。null や非文字列なら name で代用する
+        if not isinstance(a.get("label"), str) or not a["label"]:
+            a["label"] = a["name"]
     cfg.setdefault("hub", "http://127.0.0.1:8090")
     cfg.setdefault("workdir", "~/gamehub/board_work")
     cfg.setdefault("timeout", 600)
@@ -204,8 +207,9 @@ def load_config(path):
         if not isinstance(cfg[key], str) or not cfg[key]:
             sys.exit(f"config: {key} must be a non-empty string")
     timeout = cfg["timeout"]
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-        sys.exit("config: timeout must be a positive number of seconds")
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        sys.exit("config: timeout must be a positive finite number of seconds")
     return cfg
 
 
