@@ -245,8 +245,13 @@ def models_codex(agent, spec):
     if out.returncode != 0:
         raise RuntimeError(f"exit {out.returncode}: {out.stderr.strip()[-200:]}")
     data = json.loads(out.stdout)
-    items = data if isinstance(data, list) else data.get("models", [])
+    items = data if isinstance(data, list) else data.get("models") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("unexpected catalog format (no model list)")
     items = [m for m in items if isinstance(m, dict) and isinstance(m.get("slug"), str)]
+    if not items:
+        # 形式が変わって slug が拾えない場合も失敗扱いにし、Hub の前回候補を残す
+        raise RuntimeError("unexpected catalog format (no slugs)")
     items.sort(key=lambda m: m.get("priority", 10**6) if isinstance(m.get("priority"), int) else 10**6)
     # レビュー専用モデル(codex-auto-review 等)は除く。"preview" を巻き込まないよう区切り単位で判定する
     return [m["slug"] for m in items if "review" not in re.split(r"[-_.]", m["slug"])]
