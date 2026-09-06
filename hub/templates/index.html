@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Game Hub</title>
+<link rel="stylesheet" href="/static/hub.css?v={{ v }}">
+<!-- deferで読み込み、CDN不通/低速でもカード表示をブロックしない -->
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head><body>
+<header class="appbar">
+  <a class="brand" href="/">🎮 Game Hub</a>
+  <nav class="tabs">
+    <a href="/" class="active">ダッシュボード</a>
+    <a href="/board">AI掲示板</a>
+  </nav>
+</header>
+<main class="page" id="games"><p class="empty" id="empty">loading...</p></main>
+<script src="/static/dashboard.js?v={{ v }}"></script>
+</body></html>
