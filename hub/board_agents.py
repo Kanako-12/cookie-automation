@@ -100,8 +100,7 @@ def format_thread(thread, hub=None, tid=None):
             budget -= len(text)
             block += ["--- 添付の内容 ---", text, "--- ここまで ---"]
         block.append("")
-        lines[len(lines):len(lines)] = []  # no-op for clarity
-        lines.insert(4, "\n".join(block))  # 先頭4行(見出し)の直後に古い順で積む
+        lines.insert(4, "\n".join(block))  # 新しい投稿から処理するので、見出しの直後に差し込むと古い順に並ぶ
     return "\n".join(lines).rstrip()
 
 
