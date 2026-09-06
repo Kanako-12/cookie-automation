@@ -411,10 +411,15 @@ def prepare_attachments(uploads):
     return items
 
 
+def remove_files(paths):
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
 def write_attachments(tid, items):
-    """検証済みの添付を書く。途中で失敗したらこの投稿の分は全部消す"""
+    """検証済みの添付を書き、書いたパスを返す。途中で失敗したらこの投稿の分は全部消す"""
     if not items:
-        return
+        return []
     d = files_dir(tid)
     d.mkdir(parents=True, exist_ok=True)
     written = []
@@ -425,9 +430,9 @@ def write_attachments(tid, items):
             write_atomic(d / f"{meta['id']}.json", json.dumps(meta, ensure_ascii=False))
             written.append(d / f"{meta['id']}.json")
     except OSError:
-        for path in written:
-            path.unlink(missing_ok=True)
+        remove_files(written)
         abort(500, description="failed to store attachment")
+    return written
 
 
 def read_attachment(tid, fid):
@@ -607,9 +612,13 @@ def board_post(tid):
         # 添付と本文の検証を全部通してからファイルを書く(拒否された投稿の添付を残さない)
         items = prepare_attachments(uploads)
         post = make_post(payload, n, [meta for meta, _ in items])
-        write_attachments(tid, items)
+        written = write_attachments(tid, items)
         record["posts"].append(post)
-        write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
+        try:
+            write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
+        except OSError:
+            remove_files(written)  # スレッド側の書き込みに失敗したら、参照されない添付を残さない
+            abort(500, description="failed to save post")
     return jsonify(post), 201
 
 

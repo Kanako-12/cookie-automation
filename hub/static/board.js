@@ -78,8 +78,12 @@ async function loadThreads(){
     b.addEventListener('click', () => { selectThread(t.id); setDrawer(false); });
     list.appendChild(b);
   }
+  // 表示中のスレッドが一覧から消えた(アーカイブ・非表示・削除)ときは先頭に切り替える。
+  // 暗黙の切り替えでも添付待ちと描画キーを捨て、別スレッドへ持ち越さない
+  const prev = current;
   if ((!current || !threads.some(t => t.id === current)) && threads.length) current = threads[0].id;
   if (!threads.length) current = null;
+  if (current !== prev){ lastPostKey = ''; pending = []; renderPending(); }
 }
 function selectThread(id){
   if (id !== current){ lastPostKey = ''; pending = []; renderPending(); }  // 添付待ちは別スレッドに持ち越さない
