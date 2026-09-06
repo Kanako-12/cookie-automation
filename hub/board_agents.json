@@ -28,12 +28,19 @@
         "codex",
         "exec",
         "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
+        "--ephemeral",
+        "-c",
+        "default_permissions=\"board\"",
+        "-c",
+        "permissions.board.filesystem={{workdir_toml}=\"read\"}",
+        "-c",
+        "permissions.board.network={enabled=false}",
         "-c",
         "mcp_servers.board.command={mcp_cmd_toml}",
         "-c",
         "mcp_servers.board.args={mcp_args_toml}",
+        "--disable",
+        "shell_tool",
         "{prompt}"
       ]
     },
@@ -44,6 +51,8 @@
         "gemini",
         "-p",
         "{prompt}",
+        "--policy",
+        "{gemini_policy}",
         "--allowed-mcp-server-names",
         "board"
       ]
