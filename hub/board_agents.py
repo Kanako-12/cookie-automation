@@ -11,13 +11,14 @@
 非対話モードで起動する。Web版UIの自動操作や非公式APIは使わない(規約違反)。
 CLIのフラグは変わりやすいので board_agents.json 側で調整できるようにしてある。
 """
-import argparse, json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request
+import argparse, json, os, pathlib, re, subprocess, sys, time, urllib.error, urllib.request
 
 HERE = pathlib.Path(__file__).resolve()
 DEFAULT_CONFIG = HERE.with_name("board_agents.json")
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 READ_LIMIT_DEFAULT = 30  # read_threadで返す直近件数(プロンプト膨張の防止)
 READ_LIMIT_MAX = 200
+AGENT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,32}")  # hub.py の AUTHOR と同じ制約
 
 
 # ---------------------------------------------------------------- Hub client
@@ -189,8 +190,8 @@ def load_config(path):
     if not isinstance(agents, list) or not agents:
         sys.exit("config: agents must be a non-empty list")
     for a in agents:
-        if not isinstance(a, dict) or not isinstance(a.get("name"), str) or not a["name"]:
-            sys.exit("config: each agent needs a name")
+        if not isinstance(a, dict) or not isinstance(a.get("name"), str) or not AGENT_NAME.fullmatch(a["name"]):
+            sys.exit("config: each agent needs a name matching [A-Za-z0-9_.-]{1,32} (used as the board author)")
         cmd = a.get("command")
         if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
             sys.exit(f"config: agent {a['name']}: command must be a non-empty list of strings")
@@ -269,20 +270,27 @@ def agent_workdir(cfg, agent):
     return pathlib.Path(os.path.expanduser(cfg["workdir"])) / agent["name"]
 
 
+def write_atomic(path, text):
+    """起動中のCLIが書きかけの設定を読まないよう、一時ファイル経由で置き換える"""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def prepare_workdir(wd, mcp_cmd):
     """CLIごとの作業ディレクトリと、各CLI形式のMCP設定ファイルを用意する"""
     wd.mkdir(parents=True, exist_ok=True)
     server = {"command": mcp_cmd[0], "args": mcp_cmd[1:]}
     # Claude Code: --mcp-config で渡すJSON
-    (wd / "mcp.json").write_text(json.dumps({"mcpServers": {"board": server}}), encoding="utf-8")
+    write_atomic(wd / "mcp.json", json.dumps({"mcpServers": {"board": server}}))
     # Gemini CLI: cwd配下の .gemini/settings.json を読む。trust=trueで確認プロンプトを省く
     gdir = wd / ".gemini"
     gdir.mkdir(exist_ok=True)
-    (gdir / "settings.json").write_text(
-        json.dumps({"mcpServers": {"board": dict(server, trust=True)}}), encoding="utf-8")
+    write_atomic(gdir / "settings.json",
+                 json.dumps({"mcpServers": {"board": dict(server, trust=True)}}))
     # Gemini CLI: Policy Engine(--policy)で組み込みツールを全て拒否し、boardのMCPだけ許可する。
     # ユーザー層のルールは trust=true(4.2)より高い優先度で評価される
-    (wd / "board-policy.toml").write_text(GEMINI_POLICY, encoding="utf-8")
+    write_atomic(wd / "board-policy.toml", GEMINI_POLICY)
     return wd
 
 
@@ -324,7 +332,9 @@ def run_agent(cfg, agent, tid, dry_run):
         sys.exit(f"config: prompt template error ({e}); use {{label}} {{name}} {{participants}} {{thread}} only")
     wd = agent_workdir(cfg, agent)
     mcp_cmd = mcp_argv(cfg, agent, tid, wd)
-    prepare_workdir(wd, mcp_cmd)
+    if not dry_run:
+        # dry-run はロックを取らないので、実行中のCLIが読む設定ファイルには触れない
+        prepare_workdir(wd, mcp_cmd)
     argv = build_command(cfg, agent, tid, prompt, wd, mcp_cmd)
     shown = " ".join(a if len(a) <= 40 else a[:37] + "..." for a in argv[:4])
     print(f"[board] {agent['name']}: {shown} ... (cwd={wd})", flush=True)
