@@ -18,7 +18,8 @@ DEFAULT_CONFIG = HERE.with_name("board_agents.json")
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 READ_LIMIT_DEFAULT = 30  # read_threadで返す直近件数(プロンプト膨張の防止)
 READ_LIMIT_MAX = 200
-AGENT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,32}")  # hub.py の AUTHOR と同じ制約
+# hub.py の AUTHOR と同じ制約。名前は作業ディレクトリ名にも使うため "." / ".." は除外する
+AGENT_NAME = re.compile(r"(?!\.+$)[A-Za-z0-9_.-]{1,32}")
 
 
 # ---------------------------------------------------------------- Hub client
@@ -199,6 +200,12 @@ def load_config(path):
     cfg.setdefault("workdir", "~/gamehub/board_work")
     cfg.setdefault("timeout", 600)
     cfg.setdefault("prompt", DEFAULT_PROMPT)
+    for key in ("hub", "workdir", "prompt"):
+        if not isinstance(cfg[key], str) or not cfg[key]:
+            sys.exit(f"config: {key} must be a non-empty string")
+    timeout = cfg["timeout"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        sys.exit("config: timeout must be a positive number of seconds")
     return cfg
 
 
@@ -227,7 +234,7 @@ def load_state(cfg):
 def save_state(cfg, state):
     path = state_path(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state), encoding="utf-8")
+    write_atomic(path, json.dumps(state))  # 中断で空/壊れたstateを残さない
 
 
 def next_agent(agents, cfg, tid):
