@@ -307,17 +307,18 @@ def sync_models(cfg):
     """各 CLI で選べるモデル候補を Hub に登録する(ダッシュボードのプルダウン用)。失敗しても run は続ける"""
     for agent in cfg["agents"]:
         models = discover_models(agent)
-        if models is None:
-            # 取得元が無い/一時的に失敗: Hub に残っている前回の候補を消さない
-            print(f"[board] {agent['name']}: model list not updated", flush=True)
-            continue
-        payload = {"label": agent["label"], "models": models, "default": agent.get("default_model", "")}
+        # 候補が取れなくてもメンバー(ラベル・既定)は登録し、参加オフを選べるようにする。
+        # models を省略すると Hub は前回の候補を残す
+        payload = {"label": agent["label"], "default": agent.get("default_model", "")}
+        if models is not None:
+            payload["models"] = models
         try:
             hub_request(cfg["hub"], f"/board/agents/{agent['name']}/models", payload)
         except RuntimeError as e:
             print(f"  models for {agent['name']}: {e}", flush=True)
             continue
-        print(f"[board] {agent['name']}: {len(payload['models'])} model(s) registered", flush=True)
+        print(f"[board] {agent['name']}: registered"
+              + (f" ({len(models)} model(s))" if models is not None else " (model list not updated)"), flush=True)
 
 
 def load_prefs(cfg):

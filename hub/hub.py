@@ -443,11 +443,13 @@ def board_agent_models(name):
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         abort(400, description="JSON object required")
+    # models は省略可(候補の取得に失敗した runner がメンバー情報だけ登録する)。省略時は前回の候補を残す
     models = payload.get("models")
-    if not isinstance(models, list) or len(models) > AGENT_MODELS_MAX:
-        abort(400, description=f"models must be a list (max {AGENT_MODELS_MAX})")
-    if not all(isinstance(m, str) and MODEL_NAME.fullmatch(m) for m in models):
-        abort(400, description="model names must match [A-Za-z0-9._:/-]{1,80}")
+    if models is not None:
+        if not isinstance(models, list) or len(models) > AGENT_MODELS_MAX:
+            abort(400, description=f"models must be a list (max {AGENT_MODELS_MAX})")
+        if not all(isinstance(m, str) and MODEL_NAME.fullmatch(m) for m in models):
+            abort(400, description="model names must match [A-Za-z0-9._:/-]{1,80}")
     label = text_field(payload, "label", BOARD_MODEL_MAX, required=False)
     default = text_field(payload, "default", 80, required=False)
     if default and not MODEL_NAME.fullmatch(default):
@@ -455,8 +457,10 @@ def board_agent_models(name):
     with BOARD_LOCK:
         agents = read_agents()
         entry = agents.setdefault(name, {})
-        entry["models"] = list(dict.fromkeys(models))  # 順序を保って重複除去
-        entry["modelsTs"] = time.time()
+        if models is not None:
+            entry["models"] = list(dict.fromkeys(models))  # 順序を保って重複除去
+            entry["modelsTs"] = time.time()
+        entry.setdefault("models", [])
         if label:
             entry["label"] = label
         entry["default"] = default or ""
