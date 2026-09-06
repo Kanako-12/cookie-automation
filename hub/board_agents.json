@@ -29,6 +29,7 @@
         "exec",
         "--skip-git-repo-check",
         "--ephemeral",
+        "--ignore-user-config",
         "-c",
         "default_permissions=\"board\"",
         "-c",

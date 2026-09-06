@@ -183,6 +183,8 @@ def load_config(path):
         cfg = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         sys.exit(f"config {path}: {e}")
+    if not isinstance(cfg, dict):
+        sys.exit("config: root must be a JSON object")
     agents = cfg.get("agents")
     if not isinstance(agents, list) or not agents:
         sys.exit("config: agents must be a non-empty list")
@@ -357,9 +359,27 @@ def run_agent(cfg, agent, tid, dry_run):
     return False
 
 
+def acquire_lock(cfg):
+    """cronと手動実行が重なって同じ順番を二重に回さないよう、workdir単位で排他する。
+    ロックが取れなければ即終了(待たない)。fcntlが無い環境(Windows)ではロックしない"""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    workdir = pathlib.Path(os.path.expanduser(cfg["workdir"]))
+    workdir.mkdir(parents=True, exist_ok=True)
+    lock = open(workdir / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("another run is in progress (lock: %s)" % (workdir / "run.lock"))
+    return lock  # プロセス終了までファイルを開いたままにしてロックを保持する
+
+
 def run(args):
     cfg = load_config(args.config)
     agents = cfg["agents"]
+    lock = acquire_lock(cfg) if not args.dry_run else None  # noqa: F841 - 保持が目的
     try:
         tid = pick_thread(cfg, args.thread)
         if args.agent:
