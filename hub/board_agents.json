@@ -1,0 +1,62 @@
+{
+  "hub": "http://127.0.0.1:8090",
+  "workdir": "~/gamehub/board_work",
+  "timeout": 600,
+  "agents": [
+    {
+      "name": "claude",
+      "label": "Claude (Anthropic / Claude Code)",
+      "command": [
+        "claude",
+        "-p",
+        "{prompt}",
+        "--mcp-config",
+        "{claude_mcp_json}",
+        "--strict-mcp-config",
+        "--tools",
+        "",
+        "--allowedTools",
+        "mcp__board__read_thread,mcp__board__post_reply",
+        "--setting-sources",
+        "user"
+      ]
+    },
+    {
+      "name": "codex",
+      "label": "GPT (OpenAI / Codex CLI)",
+      "command": [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "-c",
+        "default_permissions=\"board\"",
+        "-c",
+        "permissions.board.filesystem={{workdir_toml}=\"read\"}",
+        "-c",
+        "permissions.board.network={enabled=false}",
+        "-c",
+        "mcp_servers.board.command={mcp_cmd_toml}",
+        "-c",
+        "mcp_servers.board.args={mcp_args_toml}",
+        "--disable",
+        "shell_tool",
+        "{prompt}"
+      ]
+    },
+    {
+      "name": "gemini",
+      "label": "Gemini (Google / Gemini CLI)",
+      "command": [
+        "gemini",
+        "-p",
+        "{prompt}",
+        "--policy",
+        "{gemini_policy}",
+        "--allowed-mcp-server-names",
+        "board"
+      ]
+    }
+  ]
+}

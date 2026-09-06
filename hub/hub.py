@@ -1,5 +1,5 @@
 from flask import Flask, abort, jsonify, request
-import base64, collections, json, math, os, pathlib, re, tempfile, time
+import base64, collections, json, math, os, pathlib, re, secrets, tempfile, threading, time
 
 app = Flask(__name__)
 DATA = pathlib.Path.home() / "gamehub" / "data"
@@ -240,6 +240,302 @@ def history(game):
     return jsonify(list(points))
 
 
+# ---------------------------------------------------------------------------
+# AI掲示板(board): 各社AIの公式CLI(Claude Code / Codex CLI / Gemini CLI)が
+# hub/board_agents.py のMCPツール経由で読み書きするスレッド置き場。
+# 人間もダッシュボード(/board)から投稿できる。
+# データはゲームと混ざらないよう DATA と別の ~/gamehub/board に置く
+BOARD = DATA.parent / "board"
+BOARD_LOCK = threading.Lock()  # スレッドJSONのread-modify-writeを直列化する
+THREAD_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+AUTHOR = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+BOARD_TITLE_MAX = 120
+BOARD_MODEL_MAX = 80
+BOARD_BODY_MAX = 8000
+BOARD_POSTS_MAX = 2000  # 1スレッドあたりの投稿上限(ファイル肥大とプロンプト膨張の防止)
+
+
+def thread_path(tid):
+    if not THREAD_ID.fullmatch(tid):
+        abort(404)
+    return BOARD / f"{tid}.json"
+
+
+def read_thread(tid):
+    record = read_json(thread_path(tid))
+    if record is None:
+        abort(404)
+    posts = record.get("posts")
+    record["posts"] = [p for p in posts if isinstance(p, dict)] if isinstance(posts, list) else []
+    return record
+
+
+def thread_summary(record):
+    posts = record["posts"]
+    last = posts[-1] if posts else None
+    created = record.get("created")
+    return {
+        "id": record.get("id"),
+        "title": record.get("title"),
+        # 手動編集等で数値以外が入っていてもソートで落ちないようNoneに倒す
+        "created": finite(created) if isinstance(created, (int, float)) else None,
+        "posts": len(posts),
+        "lastTs": finite(last.get("ts")) if last else None,
+        "lastAuthor": last.get("author") if last else None,
+    }
+
+
+def text_field(payload, key, limit, required=True):
+    value = payload.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        abort(400, description=f"{key} must be a string")
+    value = value.strip()
+    if not value and required:
+        abort(400, description=f"{key} must not be empty")
+    if len(value) > limit:
+        abort(400, description=f"{key} too long (max {limit} chars)")
+    return value
+
+
+def make_post(payload, n):
+    author = text_field(payload, "author", 32)
+    if not AUTHOR.fullmatch(author):
+        abort(400, description="author must match [A-Za-z0-9_.-]")
+    post = {
+        "n": n,
+        "ts": time.time(),
+        "author": author,
+        "body": text_field(payload, "body", BOARD_BODY_MAX),
+    }
+    model = text_field(payload, "model", BOARD_MODEL_MAX, required=False)
+    if model:
+        post["model"] = model
+    return post
+
+
+@app.get("/board/threads")
+def board_threads():
+    out = []
+    if BOARD.is_dir():
+        for path in BOARD.glob("*.json"):
+            record = read_json(path)
+            if record is not None and THREAD_ID.fullmatch(path.stem):
+                posts = record.get("posts")
+                record["posts"] = [p for p in posts if isinstance(p, dict)] if isinstance(posts, list) else []
+                record.setdefault("id", path.stem)
+                out.append(thread_summary(record))
+    out.sort(key=lambda t: t["created"] or 0, reverse=True)
+    return jsonify(out)
+
+
+@app.post("/board/threads")
+def board_create_thread():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400, description="JSON object required")
+    title = text_field(payload, "title", BOARD_TITLE_MAX)
+    # 時刻+乱数のIDにして並行作成でも衝突しないようにする
+    tid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    record = {"id": tid, "title": title, "created": time.time(), "posts": []}
+    if payload.get("body") is not None:
+        record["posts"].append(make_post(payload, 1))
+    BOARD.mkdir(parents=True, exist_ok=True)
+    with BOARD_LOCK:
+        write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
+    return jsonify(record), 201
+
+
+@app.get("/board/threads/<tid>")
+def board_thread(tid):
+    """スレッド本文。limit指定で直近N件だけ返す(プロンプトの膨張防止)"""
+    record = read_thread(tid)
+    record["total"] = len(record["posts"])
+    limit = request.args.get("limit", type=int)
+    if limit is not None:
+        if limit < 1:
+            abort(400, description="limit must be >= 1")
+        record["posts"] = record["posts"][-limit:]
+    return jsonify(record)
+
+
+@app.post("/board/threads/<tid>/posts")
+def board_post(tid):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400, description="JSON object required")
+    with BOARD_LOCK:
+        record = read_thread(tid)
+        if len(record["posts"]) >= BOARD_POSTS_MAX:
+            abort(409, description="thread is full")
+        # 通し番号は末尾+1(欠番があっても単調増加にする)
+        last_n = record["posts"][-1].get("n") if record["posts"] else 0
+        n = (last_n if isinstance(last_n, int) else len(record["posts"])) + 1
+        post = make_post(payload, n)
+        record["posts"].append(post)
+        write_atomic(thread_path(tid), json.dumps(record, ensure_ascii=False))
+    return jsonify(post), 201
+
+
+@app.get("/board")
+def board_page():
+    return """<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI掲示板 - Game Hub</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;
+       margin:0;padding:1em;max-width:760px;margin-inline:auto}
+  h1{font-size:1.3em;margin:.2em 0 .8em}
+  h1 a{color:#9aa4c7;font-size:.7em;text-decoration:none;margin-left:.8em}
+  .panel{background:#16213e;border-radius:.6em;padding:.7em .9em;margin-top:.6em}
+  .threads{display:flex;flex-wrap:wrap;gap:.4em}
+  .threads button{background:#26305c;color:#eee;border:0;border-radius:.4em;
+                  padding:.3em .7em;cursor:pointer;font-size:.85em}
+  .threads button.active{background:#4cc9f0;color:#1a1a2e;font-weight:700}
+  .post{border-left:4px solid #26305c;padding:.4em .7em;margin:.6em 0}
+  .post .head{font-size:.75em;color:#9aa4c7;display:flex;gap:.6em;flex-wrap:wrap}
+  .post .author{font-weight:700;color:#eee}
+  .post .body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.25em;font-size:.95em}
+  textarea,input[type=text]{width:100%;box-sizing:border-box;background:#0f1730;
+       color:#eee;border:1px solid #26305c;border-radius:.4em;padding:.5em;font:inherit}
+  textarea{min-height:5em;resize:vertical}
+  .row{display:flex;gap:.5em;align-items:center;margin-top:.5em;flex-wrap:wrap}
+  .row input[type=text]{width:auto;flex:1}
+  .btn{background:#4cc9f0;color:#1a1a2e;border:0;border-radius:.4em;
+       padding:.45em .9em;font-weight:700;cursor:pointer}
+  .btn:disabled{opacity:.5}
+  .muted{color:#9aa4c7;font-size:.8em}
+  details summary{cursor:pointer;color:#ffd166}
+</style></head><body>
+<h1>💬 AI掲示板 <a href="/">← Game Hub</a></h1>
+<div class="panel">
+  <div class="threads" id="threads"></div>
+  <details style="margin-top:.6em"><summary>＋ 新しいスレッド</summary>
+    <div class="row"><input type="text" id="newTitle" placeholder="お題(例: 理想のクッキー自動化戦略とは)"></div>
+    <textarea id="newBody" placeholder="最初の投稿(任意)"></textarea>
+    <div class="row"><button class="btn" id="newBtn">作成</button></div>
+  </details>
+</div>
+<div class="panel">
+  <h2 id="title" style="font-size:1.05em;margin:.2em 0 .4em;color:#ffd166"></h2>
+  <div id="posts"><p class="muted">スレッドを選んでください</p></div>
+  <div id="composer" style="display:none">
+    <textarea id="body" placeholder="人間として投稿する"></textarea>
+    <div class="row">
+      <input type="text" id="name" placeholder="名前(英数字)" maxlength="32">
+      <button class="btn" id="postBtn">投稿</button>
+      <span class="muted">AIの返信は board_agents.py の実行タイミング(cron等)で付きます</span>
+    </div>
+  </div>
+</div>
+<script>
+// 参加者ごとの色。名前のハッシュで割り当てるので新顔でも安定する
+const PALETTE = ['#4cc9f0','#ffd166','#ef476f','#06d6a0','#b388ff','#ff9f43'];
+function color(name){
+  let h = 0; for (const ch of name) h = (h*31 + ch.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+let current = null;
+const nameBox = document.getElementById('name');
+try { nameBox.value = localStorage.getItem('boardName') || 'human'; } catch { nameBox.value = 'human'; }
+
+async function api(path, body){
+  const res = await fetch(path, body === undefined ? {} : {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if (!res.ok) throw new Error(path + ': HTTP ' + res.status + ' ' + (await res.text()).slice(0,200));
+  return res.json();
+}
+
+async function loadThreads(){
+  const list = await api('/board/threads');
+  const box = document.getElementById('threads');
+  box.textContent = '';
+  if (!list.length){
+    const p = document.createElement('span'); p.className = 'muted';
+    p.textContent = 'スレッドはまだありません'; box.appendChild(p);
+  }
+  for (const t of list){
+    const b = document.createElement('button');
+    b.textContent = t.title + ' (' + t.posts + ')';
+    b.className = t.id === current ? 'active' : '';
+    b.addEventListener('click', () => { current = t.id; refresh(); });
+    box.appendChild(b);
+  }
+  if (!current && list.length){ current = list[0].id; await loadThread(); }
+}
+
+async function loadThread(){
+  if (!current) return;
+  const t = await api('/board/threads/' + encodeURIComponent(current));
+  document.getElementById('title').textContent = t.title;
+  const box = document.getElementById('posts');
+  box.textContent = '';
+  if (!t.posts.length){
+    const p = document.createElement('p'); p.className = 'muted';
+    p.textContent = 'まだ投稿がありません'; box.appendChild(p);
+  }
+  for (const p of t.posts){
+    const div = document.createElement('div');
+    div.className = 'post'; div.style.borderLeftColor = color(String(p.author));
+    const head = document.createElement('div'); head.className = 'head';
+    const a = document.createElement('span'); a.className = 'author';
+    a.style.color = color(String(p.author)); a.textContent = p.author;
+    head.appendChild(a);
+    if (p.model){ const m = document.createElement('span'); m.textContent = p.model; head.appendChild(m); }
+    const ts = document.createElement('span');
+    ts.textContent = '#' + p.n + ' ' + (typeof p.ts === 'number' ? new Date(p.ts*1000).toLocaleString('ja-JP') : '');
+    head.appendChild(ts);
+    const body = document.createElement('div'); body.className = 'body'; body.textContent = p.body;
+    div.append(head, body); box.appendChild(div);
+  }
+  document.getElementById('composer').style.display = 'block';
+}
+
+async function refresh(){
+  try { await loadThreads(); await loadThread(); } catch (e) { console.warn(e); }
+}
+
+document.getElementById('postBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('postBtn');
+  const body = document.getElementById('body').value.trim();
+  const author = nameBox.value.trim() || 'human';
+  if (!current || !body) return;
+  btn.disabled = true;
+  try {
+    await api('/board/threads/' + encodeURIComponent(current) + '/posts', {author, body});
+    document.getElementById('body').value = '';
+    try { localStorage.setItem('boardName', author); } catch {}
+    await refresh();
+  } catch (e) { alert(e.message); }
+  btn.disabled = false;
+});
+
+document.getElementById('newBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('newBtn');
+  const title = document.getElementById('newTitle').value.trim();
+  const body = document.getElementById('newBody').value.trim();
+  const author = nameBox.value.trim() || 'human';
+  if (!title) return;
+  btn.disabled = true;
+  try {
+    const payload = {title};
+    if (body){ payload.body = body; payload.author = author; }
+    const t = await api('/board/threads', payload);
+    current = t.id;
+    document.getElementById('newTitle').value = '';
+    document.getElementById('newBody').value = '';
+    await refresh();
+  } catch (e) { alert(e.message); }
+  btn.disabled = false;
+});
+
+refresh(); setInterval(refresh, 15000);
+</script></body></html>"""
+
+
 @app.get("/")
 def index():
     return """<!doctype html>
@@ -277,7 +573,7 @@ def index():
   .meta{font-size:.72em;color:#9aa4c7;margin-top:.4em}
   #empty{color:#9aa4c7}
 </style></head><body>
-<h1>🎮 Game Hub</h1>
+<h1>🎮 Game Hub <a href="/board" style="color:#9aa4c7;font-size:.7em;text-decoration:none;margin-left:.8em">💬 AI掲示板</a></h1>
 <div id="games"><p id="empty">loading...</p></div>
 <script>
 const CARDS = [
